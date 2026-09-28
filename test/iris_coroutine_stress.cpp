@@ -8,7 +8,6 @@
 // We disable IRIS_ASSERT (`NDEBUG`) so that production behavior is observed
 // when invoking buggy code paths.
 
-#define NDEBUG
 #include "../src/iris_coroutine.h"
 #include "../src/iris_common.inl"
 #include <atomic>
