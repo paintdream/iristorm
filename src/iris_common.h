@@ -576,7 +576,7 @@ namespace iris {
 
 	template <typename type_t>
 	struct iris_is_iterable<type_t,
-		iris_void_t<decltype(std::begin(std::declval<type_t>())), decltype(std::end(std::declval<type_t>()))>
+		iris_void_t<decltype(std::begin(std::declval<type_t&>())), decltype(std::end(std::declval<type_t&>()))>
 	> : std::true_type {};
 
 	template <typename type_t, typename = void>
