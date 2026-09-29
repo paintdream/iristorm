@@ -1575,6 +1575,138 @@ namespace iris {
 			return nullptr;
 		}
 
+		// set 'current' lua table, binding a computed property to custom getter/setter
+		// functions: lua reads a.x -> getter(object), writes a.x = v -> setter(object, v).
+		// getter and setter are member function pointers, or free function pointers whose
+		// first parameter is the owner. pass only a getter (or nullptr as the setter) for
+		// a read-only property.
+		template <auto getter, auto setter = nullptr, typename type_t = void, typename key_t, typename... envs_t>
+		reflection_t set_current_prop(key_t&& key, envs_t&&... envs) {
+			static_assert(std::is_member_function_pointer_v<decltype(getter)> || (std::is_pointer_v<decltype(getter)> && std::is_function_v<std::remove_pointer_t<decltype(getter)>>), "A property getter must be a member or free function pointer.");
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			check_matched_class_type<getter, type_t>(L);
+
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			lua_pushcclosure(L, &iris_lua_t::property_custom_get_proxy<getter, type_t>, 0);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (setter != nullptr) {
+				static_assert(std::is_member_function_pointer_v<decltype(setter)> || (std::is_pointer_v<decltype(setter)> && std::is_function_v<std::remove_pointer_t<decltype(setter)>>), "A property setter must be a member or free function pointer.");
+
+				check_matched_class_type<setter, type_t>(L);
+
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_custom_set_proxy<setter, type_t>, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			} else {
+				// read-only: register an erroring __set so assignments fail loudly
+				// instead of silently no-opping (matches const member properties)
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
+		// functor form of set_current_prop, mirroring set_current(key, functor):
+		// stateful getters/setters are stored in gc-managed userdata referenced
+		// as closure upvalues. the functor's first parameter is the owner (T* or T&),
+		// setters take exactly one additional value parameter.
+		template <typename key_t, typename getter_t>
+		reflection_t set_current_prop(key_t&& key, getter_t&& getter) {
+			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter));
+		}
+
+		template <typename key_t, typename getter_t, typename setter_t>
+		reflection_t set_current_prop(key_t&& key, getter_t&& getter, setter_t&& setter) {
+			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter), std::forward<setter_t>(setter));
+		}
+
+		template <typename key_t, typename getter_t, typename... setter_t>
+		reflection_t set_current_prop_functor_internal(key_t&& key, getter_t&& getter, setter_t&&... setter) {
+			using getter_value_t = remove_cvref_t<getter_t>;
+			static_assert(is_functor<getter_value_t>::value, "A property getter must be a functor with operator ().");
+			static_assert(std::is_class_v<getter_value_t>, "Use the set_current_prop<&getter, &setter>(name) form for plain function pointers.");
+
+			using getter_traits_t = functor_property_traits_t<decltype(&getter_value_t::operator ())>;
+			static_assert(getter_traits_t::arg_count == 1, "A property getter functor must take the owner as its only parameter.");
+			static_assert(!std::is_void_v<typename getter_traits_t::result>, "A property getter must not return void.");
+
+			using owner_t = functor_property_owner_t<getter_value_t>;
+			static_assert(std::is_class_v<owner_t>, "The first parameter of a property functor must be a pointer or reference to the owner class.");
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				static_assert(sizeof...(setter_t) == 1, "Only one setter functor is allowed.");
+				static_assert(is_functor<setter_value_t>::value, "A property setter must be a functor with operator ().");
+
+				using setter_traits_t = functor_property_traits_t<decltype(&setter_value_t::operator ())>;
+				static_assert(setter_traits_t::arg_count == 2, "A property setter functor must take the owner and exactly one value parameter.");
+				static_assert(std::is_same_v<std::remove_cv_t<functor_property_owner_t<setter_value_t>>, std::remove_cv_t<owner_t>>, "Getter and setter functors must share the same owner type.");
+			}
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			// __get entry: closure holding the getter functor as upvalue
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			push_property_functor(L, std::forward<getter_t>(getter));
+			lua_pushcclosure(L, &iris_lua_t::property_functor_get_proxy<owner_t, getter_value_t>, 1);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				push_property_functor(L, std::forward<setter_t>(setter)...);
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				lua_pushcclosure(L, &iris_lua_t::property_functor_set_proxy<functor_property_owner_t<setter_value_t>, setter_value_t>, 1);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			} else {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
 		template <auto ptr, typename key_t, typename... envs_t>
 		reflection_t set_current_new(key_t&& key, envs_t&&... envs) {
 			return set_current_new_internal<ptr>(ptr, std::forward<key_t>(key), std::forward<envs_t>(envs)...);
@@ -2520,7 +2652,7 @@ namespace iris {
 
 			if constexpr (!std::is_trivially_destructible_v<object_t>) {
 				lua_newtable(L);
-				make_uniform_meta_internal<type_t, 0>(L);
+				make_uniform_meta_internal<type_t>(L);
 				lua_setmetatable(L, -2);
 			}
 
@@ -3482,8 +3614,7 @@ namespace iris {
 			using value_t = decltype(object->*prop);
 			stack_guard_t guard(L, 1);
 			push_variable(L, object->*prop); // return the property value
-			return 1;
-		}
+			return 1;		}
 
 		template <auto prop, typename type_t>
 		static int property_get_proxy(lua_State* L) {
@@ -3510,6 +3641,190 @@ namespace iris {
 		template <auto prop, typename type_t>
 		static int property_set_proxy(lua_State* L) {
 			return property_set_proxy_dispatch<decltype(prop), type_t>(L, prop);
+		}
+
+		// decompose a getter/setter callable (member function pointer or a free
+		// function pointer taking the owner as its first parameter) used by
+		// set_current_prop, following the four [const][noexcept] member specs
+		template <typename ptr_t>
+		struct member_callable_traits_t;
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...)> {
+			using owner = class_t;
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+		};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) noexcept> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) const> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename class_t, typename... args_t>
+		struct member_callable_traits_t<return_t (class_t::*)(args_t...) const noexcept> : member_callable_traits_t<return_t (class_t::*)(args_t...)> {};
+
+		template <typename return_t, typename first_t, typename... args_t>
+		struct member_callable_traits_t<return_t (*)(first_t, args_t...)> {
+			using owner = std::remove_pointer_t<first_t>;
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+		};
+
+		// __get entry generated by set_current_prop: calls a custom getter
+		template <auto getter, typename subtype_t>
+		static int property_custom_get_proxy(lua_State* L) {
+			using traits_t = member_callable_traits_t<decltype(getter)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			static_assert(!std::is_void_v<typename traits_t::result>, "A property getter must not return void.");
+			static_assert(traits_t::arg_count == 0, "A property getter must take no arguments besides the owner.");
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			stack_guard_t guard(L, 1);
+			if constexpr (std::is_member_function_pointer_v<decltype(getter)>) {
+				push_variable(L, (object->*getter)());
+			} else {
+				push_variable(L, getter(object));
+			}
+
+			return 1;
+		}
+
+		// __set entry for getter-only properties: report an error instead of
+		// letting the assignment silently no-op (matches the const member behavior)
+		static int property_readonly_set_proxy(lua_State* L) {
+			return syserror(L, "error.exec", "Cannot modify a read-only property.\n");
+		}
+
+		// decompose a getter/setter functor signature: the first parameter is the
+		// owner (T* or T&), setters take exactly one additional value parameter
+		template <typename functor_t>
+		struct functor_property_traits_t;
+
+		template <typename functor_t, typename return_t, typename... args_t>
+		struct functor_property_traits_t<return_t (functor_t::*)(args_t...)> {
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+			static constexpr bool is_const = false;
+		};
+
+		template <typename functor_t, typename return_t, typename... args_t>
+		struct functor_property_traits_t<return_t (functor_t::*)(args_t...) const> {
+			using result = return_t;
+			using args_tuple = std::tuple<args_t...>;
+			static constexpr size_t arg_count = sizeof...(args_t);
+			static constexpr bool is_const = true;
+		};
+
+		template <typename functor_t>
+		using functor_property_owner_t = std::conditional_t<
+			std::is_pointer_v<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>,
+			std::remove_pointer_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>,
+			std::remove_reference_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>>;
+
+		// create a userdata holding a moved/copyed functor with __gc if needed,
+		// mirroring push_functor_internal's storage (used as closure upvalue)
+		template <typename functor_t>
+		static void push_property_functor(lua_State* L, functor_t&& functor) {
+			using value_t = remove_cvref_t<functor_t>;
+			void* userdata = lua_newuserdatauv(L, iris_to_alignment(sizeof(value_t), size_mask_alignment), 0);
+			if constexpr (std::is_rvalue_reference_v<functor_t&&>) {
+				new (userdata) value_t(std::move(functor));
+			} else {
+				new (userdata) value_t(functor);
+			}
+
+			if constexpr (!std::is_trivially_destructible_v<value_t>) {
+				lua_newtable(L);
+				make_uniform_meta_internal<value_t>(L);
+				lua_setmetatable(L, -2);
+			}
+		}
+
+		// __get entry for functor getters: upvalue 1 holds the functor userdata
+		template <typename owner_t, typename getter_t>
+		static int property_functor_get_proxy(lua_State* L) {
+			getter_t* functor = reinterpret_cast<getter_t*>(lua_touserdata(L, lua_upvalueindex(1)));
+			IRIS_ASSERT(functor != nullptr);
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			using first_t = std::tuple_element_t<0, typename functor_property_traits_t<decltype(&getter_t::operator ())>::args_tuple>;
+			stack_guard_t guard(L, 1);
+			if constexpr (std::is_pointer_v<first_t>) {
+				push_variable(L, (*functor)(object));
+			} else {
+				push_variable(L, (*functor)(*object));
+			}
+
+			return 1;
+		}
+
+		// __set entry for functor setters: upvalue 1 holds the functor userdata,
+		// value is read from stack index 3 (index 2 holds the key)
+		template <typename owner_t, typename setter_t>
+		static int property_functor_set_proxy(lua_State* L) {
+			setter_t* functor = reinterpret_cast<setter_t*>(lua_touserdata(L, lua_upvalueindex(1)));
+			IRIS_ASSERT(functor != nullptr);
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			using traits_t = functor_property_traits_t<decltype(&setter_t::operator ())>;
+			using first_t = std::tuple_element_t<0, typename traits_t::args_tuple>;
+			using value_t = remove_cvref_t<std::tuple_element_t<1, typename traits_t::args_tuple>>;
+
+			if (!check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+				return syserror(L, "error.parameter", "Invalid value for property of type %s.\n", get_lua_name<value_t>());
+			}
+
+			if constexpr (std::is_pointer_v<first_t>) {
+				(*functor)(object, get_variable<value_t>(L, 3));
+			} else {
+				(*functor)(*object, get_variable<value_t>(L, 3));
+			}
+
+			return 0;
+		}
+
+		// __set entry generated by set_current_prop: calls a custom setter with
+		// the value at stack index 3 (index 2 holds the key, as in property_set_proxy)
+		template <auto setter, typename subtype_t>
+		static int property_custom_set_proxy(lua_State* L) {
+			using traits_t = member_callable_traits_t<decltype(setter)>;
+			using owner_t = std::conditional_t<std::is_void_v<subtype_t>, typename traits_t::owner, subtype_t>;
+			static_assert(traits_t::arg_count == 1, "A property setter must take exactly one value argument besides the owner.");
+			using value_t = remove_cvref_t<std::tuple_element_t<0, typename traits_t::args_tuple>>;
+
+			owner_t* object = get_variable<owner_t*>(L, 1);
+			if (object == nullptr) {
+				return syserror(L, "error.parameter", "The first parameter of a property must be a C++ instance of type %s.\n", get_lua_name<owner_t>());
+			}
+
+			if (!check_required_parameters<value_t>(L, 0, 0, false, 3, true)) {
+				return syserror(L, "error.parameter", "Invalid value for property of type %s.\n", get_lua_name<value_t>());
+			}
+
+			if constexpr (std::is_member_function_pointer_v<decltype(setter)>) {
+				(object->*setter)(get_variable<value_t>(L, 3));
+			} else {
+				setter(object, get_variable<value_t>(L, 3));
+			}
+
+			return 0;
 		}
 
 		// decompose a member object pointer into its value and owner types

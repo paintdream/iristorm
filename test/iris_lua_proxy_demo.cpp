@@ -78,6 +78,42 @@ struct holder_t {
 	}
 };
 
+struct engine_t {
+	int speed = 0;
+	std::string name = "idle";
+	int doubled_reads = 0;
+
+	int get_speed() const noexcept { return speed; }
+	void set_speed(int v) { speed = v; }
+
+	std::string get_label() const { return name + "@" + std::to_string(speed); }
+
+	int get_doubled() { ++doubled_reads; return speed * 2; }
+
+	static void lua_registar(lua_t lua, std::nullptr_t) {
+		// custom property: member function getter/setter pair
+		lua.set_current_prop<&engine_t::get_speed, &engine_t::set_speed>("speed_rw");
+		// read-only via member function (getter only)
+		lua.set_current_prop<&engine_t::get_label>("label");
+		// getter with side effects
+		lua.set_current_prop<&engine_t::get_doubled, &engine_t::set_speed>("doubled");
+		// free function getter/setter pair (first arg is the owner)
+		lua.set_current_prop<&engine_t::free_get, &engine_t::free_set>("free_rw");
+
+		// stateful functor getter/setter pair (captures scale)
+		int scale = 3;
+		lua.set_current_prop("scaled",
+			[scale](const engine_t* e) { return e->speed * scale; },
+			[scale](engine_t* e, int v) { e->set_speed(v / scale); });
+
+		// read-only functor getter
+		lua.set_current_prop("readonly_functor", [scale](engine_t* e) { return e->speed + scale; });
+	}
+
+	static std::string free_get(engine_t* e) { return e->name; }
+	static void free_set(engine_t* e, std::string&& v) { e->name = std::move(v); }
+};
+
 static const char* proxy_lua_code = R"lua(
 local m = getmetatable(a.numbers)
 
@@ -196,6 +232,39 @@ assert(dm.count(h.lookup, "b") == 1)
 local ckeys = dm.keys(h.lookup)
 assert(#ckeys == 2 and ckeys[1] == "a" and ckeys[2] == "b")
 
+-- custom properties: member getter/setter pair
+assert(e.speed_rw == 0)
+e.speed_rw = 7
+assert(e.speed_rw == 7 and e.label == "idle@7")
+
+-- read-only property: assignment must fail
+local pok = pcall(function() e.label = "x" end)
+assert(not pok)
+
+-- getter with side effects, sharing the setter
+assert(e.doubled == 14)
+e.doubled = 10
+assert(e.doubled == 20 and e.speed_rw == 10)
+
+-- free function getter/setter
+assert(e.free_rw == "idle")
+e.free_rw = "renamed"
+assert(e.free_rw == "renamed" and e.label == "renamed@10")
+
+-- wrong value type must error, not corrupt
+local pok2 = pcall(function() e.speed_rw = {} end)
+assert(not pok2)
+
+-- stateful functor getter/setter (scale = 3)
+assert(e.scaled == 30)
+e.scaled = 36
+assert(e.speed_rw == 12 and e.scaled == 36)
+
+-- read-only functor getter
+assert(e.readonly_functor == 15)
+local pok3 = pcall(function() e.readonly_functor = 1 end)
+assert(not pok3)
+
 print("proxy demo passed")
 )lua";
 int main(void) {
@@ -205,6 +274,7 @@ int main(void) {
 
 	auto account_type = lua.make_registry_type<account_t>();
 	auto holder_type = lua.make_registry_type<holder_t>();
+	auto engine_type = lua.make_registry_type<engine_t>();
 
 	// lua-owned host
 	lua.set_global("a", lua.make_object<account_t>(account_type, account_t()));
@@ -224,6 +294,9 @@ int main(void) {
 		h->values.push_back(3);
 	}
 
+	// custom-property host
+	lua.set_global("e", lua.make_object<engine_t>(engine_type, engine_t()));
+
 	auto result = lua.call<void>(lua.load(proxy_lua_code));
 	if (!result) {
 		fprintf(stderr, "Lua code error: %s\n", result.message.c_str());
@@ -242,6 +315,9 @@ int main(void) {
 		auto h = lua.get_global<holder_t*>("h").value();
 		IRIS_ASSERT(h->values.size() == 4 && (*h->values.begin()) == 10);
 		IRIS_ASSERT(h->lookup["a"] == 1 && h->lookup["b"] == 2);
+
+		auto e = lua.get_global<engine_t*>("e").value();
+		IRIS_ASSERT(e->speed == 12 && e->doubled_reads == 2 && e->name == "renamed");
 	}
 
 	// C++-side owned host through a view
@@ -263,6 +339,7 @@ int main(void) {
 	// force a full GC cycle: proxies must not crash and must release their anchors
 	lua.call<void>(lua.load("collectgarbage('collect') collectgarbage('collect')"));
 
+	lua.deref(std::move(engine_type));
 	lua.deref(std::move(holder_type));
 	lua.deref(std::move(account_type));
 	lua_close(L);
