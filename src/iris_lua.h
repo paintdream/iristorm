@@ -32,6 +32,7 @@ SOFTWARE.
 #include "iris_common.h"
 #include <array>
 #include <optional>
+#include <queue>
 
 extern "C" {
 #if !USE_LUA_LIBRARY
@@ -111,6 +112,43 @@ namespace iris {
 	// A simple lua binding with C++17
 	template <typename container_type>
 	struct proxy_view_t; // forward declaration: members of iris_lua_t reference it
+
+	// ---- container face detection (structured ducktyping, mirrors iris_is_map) ----
+	// queue face: FIFO/LIFO structures without random access (std::queue, iris_queue_list_t):
+	// value_type + size() + empty() + front() + push(v) + pop()
+	template <typename type_t, typename = void>
+	struct iris_is_queue : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_queue<type_t, iris_void_t<
+		typename type_t::value_type,
+		decltype(std::declval<type_t>().size()),
+		decltype(std::declval<type_t>().empty()),
+		decltype(std::declval<type_t>().front()),
+		decltype(std::declval<type_t>().push(std::declval<typename type_t::value_type>())),
+		decltype(std::declval<type_t>().pop())
+	>> : std::true_type {};
+
+	// heap face: priority queues (std::priority_queue): value_type + size() + empty() + top() + push(v) + pop()
+	template <typename type_t, typename = void>
+	struct iris_is_heap : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_heap<type_t, iris_void_t<
+		typename type_t::value_type,
+		decltype(std::declval<type_t>().size()),
+		decltype(std::declval<type_t>().empty()),
+		decltype(std::declval<type_t>().top()),
+		decltype(std::declval<type_t>().push(std::declval<typename type_t::value_type>())),
+		decltype(std::declval<type_t>().pop())
+	>> : std::true_type {};
+
+	// optional back() probe for the queue face (std::queue has it, iris_queue_list_t does not)
+	template <typename type_t, typename = void>
+	struct iris_is_backable : std::false_type {};
+
+	template <typename type_t>
+	struct iris_is_backable<type_t, iris_void_t<decltype(std::declval<type_t>().back())>> : std::true_type {};
 
 	struct iris_lua_t : enable_read_write_fence_t<> {
 		template <typename container_type>
@@ -1561,6 +1599,9 @@ namespace iris {
 
 			if constexpr (std::is_const_v<typename member_object_traits_t<decltype(ptr)>::value>) {
 				// const members are read-only proxies, no __set entry
+			} else if constexpr (!std::is_copy_assignable_v<std::remove_const_t<typename member_object_traits_t<decltype(ptr)>::value>>) {
+				// move-only containers (e.g. iris_queue_list_t) cannot take the whole-container
+				// copy assignment in property_proxy_set_proxy, no __set entry either
 			} else {
 				lua_pushliteral(L, "__set");
 				lua_rawget(L, -2);
@@ -3876,7 +3917,22 @@ namespace iris {
 
 			// a.vector = {1, 2, 3}
 			if (lua_istable(L, 3)) {
-				member = get_variable<member_t>(L, 3);
+				if constexpr (iris_is_queue<member_t>::value || iris_is_heap<member_t>::value) {
+					// queue/heap containers are not iterable: clear then push elements one by one
+					while (!member.empty()) {
+						member.pop();
+					}
+
+					size_t len = static_cast<size_t>(lua_rawlen(L, 3));
+					for (size_t i = 0; i < len; i++) {
+						lua_rawgeti(L, 3, static_cast<int>(i) + 1);
+						member.push(get_variable<typename member_t::value_type>(L, -1));
+						lua_pop(L, 1);
+					}
+				} else {
+					member = get_variable<member_t>(L, 3);
+				}
+
 				return 0;
 			}
 
@@ -4432,6 +4488,12 @@ namespace iris {
 		using mutable_container_t = std::remove_const_t<container_type>;
 		static constexpr bool const_view = std::is_const_v<container_type>;
 		static constexpr bool map_view = iris_is_map<mutable_container_t>::value;
+		// queue/heap faces take precedence over the iterable sequence face detection
+		// would otherwise be ambiguous: they are disjoint container shapes (no operator[],
+		// no begin/end for std::queue/priority_queue), checked before the sequence branch.
+		static constexpr bool queue_view = !map_view && iris_is_queue<mutable_container_t>::value;
+		static constexpr bool heap_view = !map_view && !queue_view && iris_is_heap<mutable_container_t>::value;
+		static constexpr bool sequence_view = !map_view && !queue_view && !heap_view;
 
 		container_t* ptr = nullptr;
 		bool owned = false;
@@ -4499,6 +4561,10 @@ namespace iris {
 				}
 
 				return 1;
+			} else if constexpr (queue_view || heap_view) {
+				// queue/heap faces have no random access data keys at all
+				lua_pushnil(L);
+				return 1;
 			} else {
 				if (lua_type(L, 2) != LUA_TNUMBER) {
 					lua_pushnil(L); // sequences only have integer data keys, anything else misses
@@ -4528,6 +4594,9 @@ namespace iris {
 
 			if constexpr (const_view) {
 				return iris_lua_t::syserror(L, "error.exec", "Cannot modify a const proxy of %s.\n", iris_lua_t::get_lua_name<proxy_view_t>());
+			} else if constexpr (queue_view || heap_view) {
+				// queue/heap faces have no element assignment path, push()/pop() only
+				return iris_lua_t::syserror(L, "error.exec", "Queue/heap proxies do not support element assignment, use push()/pop() instead.\n");
 			} else if constexpr (map_view) {
 				using key_t = typename mutable_container_t::key_type;
 				using mapped_t = typename mutable_container_t::mapped_type;
@@ -4589,7 +4658,15 @@ namespace iris {
 				return lua_self_error(L);
 			}
 
-			self->ptr->clear();
+			if constexpr (queue_view || heap_view) {
+				// std::queue/std::priority_queue lack clear(): drain instead
+				while (!self->ptr->empty()) {
+					self->ptr->pop();
+				}
+			} else {
+				self->ptr->clear();
+			}
+
 			return 0;
 		}
 
@@ -4599,7 +4676,106 @@ namespace iris {
 				return lua_self_error(L);
 			}
 
-			return iris_lua_t::push_proxy_owned_variable<proxy_view_t<mutable_container_t>>(L, *self->ptr);
+			if constexpr (std::is_copy_constructible_v<mutable_container_t>) {
+				return iris_lua_t::push_proxy_owned_variable<proxy_view_t<mutable_container_t>>(L, *self->ptr);
+			} else {
+				// move-only containers (e.g. iris_queue_list_t) cannot be cloned,
+				// the clone entry is not registered in lua_registar either
+				return lua_self_error(L);
+			}
+		}
+
+		// ---- queue/heap methods ----
+
+		static int lua_front(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "front() on an empty queue.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->front());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_back(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view && iris_is_backable<mutable_container_t>::value) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "back() on an empty queue.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->back());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_top(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (heap_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "top() on an empty heap.\n");
+				}
+
+				iris_lua_t::push_variable(L, self->ptr->top());
+				return 1;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_push(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view || heap_view) {
+				using value_t = typename mutable_container_t::value_type;
+				if (!iris_lua_t::check_required_parameters<value_t>(L, 0, 0, false, 2, true)) {
+					return iris_lua_t::syserror(L, "error.parameter", "push() expects a valid element value.\n");
+				}
+
+				self->ptr->push(iris_lua_t::get_variable<value_t>(L, 2));
+				return 0;
+			} else {
+				return lua_self_error(L);
+			}
+		}
+
+		static int lua_queue_pop(lua_State* L) {
+			proxy_view_t* self = get_self(L);
+			if (self == nullptr) {
+				return lua_self_error(L);
+			}
+
+			if constexpr (queue_view || heap_view) {
+				if (self->ptr->empty()) {
+					return iris_lua_t::syserror(L, "error.exec", "pop() on an empty queue/heap.\n");
+				}
+
+				self->ptr->pop();
+				return 0;
+			} else {
+				return lua_self_error(L);
+			}
 		}
 
 		// ---- sequence methods ----
@@ -4842,6 +5018,24 @@ namespace iris {
 				if constexpr (!const_view) {
 					lua.set_current<&proxy_view_t::lua_insert_value>("insert");
 					lua.set_current<&proxy_view_t::lua_erase>("erase");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+				}
+				} else if constexpr (queue_view) {
+				lua.set_current<&proxy_view_t::lua_front>("front");
+				if constexpr (iris_is_backable<mutable_container_t>::value) {
+					lua.set_current<&proxy_view_t::lua_back>("back");
+				}
+
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_push>("push");
+					lua.set_current<&proxy_view_t::lua_queue_pop>("pop");
+					lua.set_current<&proxy_view_t::lua_clear>("clear");
+				}
+			} else if constexpr (heap_view) {
+				lua.set_current<&proxy_view_t::lua_top>("top");
+				if constexpr (!const_view) {
+					lua.set_current<&proxy_view_t::lua_push>("push");
+					lua.set_current<&proxy_view_t::lua_queue_pop>("pop");
 					lua.set_current<&proxy_view_t::lua_clear>("clear");
 				}
 			} else {
