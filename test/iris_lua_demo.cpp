@@ -168,6 +168,7 @@ struct example_t : example_base_t {
 		lua.set_current<&example_t::native_call_noexcept>("native_call_noexcept");
 		lua.set_current_overload<iris_overload_cast<int>(&example_t::overload_func)>("overload_func");
 		lua.set_current_overload<iris_overload_cast<int, int>(&example_t::overload_func)>("overload_func");
+		lua.set_current_prop<&example_t::get_prop_value, &example_t::set_prop_value>("prop_value");
 #if USE_LUA_COROUTINE
 		lua.set_current_overload<iris_overload_cast<iris::iris_coroutine_t<int>, const std::string&>(&example_t::coro_get_int)>("coro_get_int");
 		lua.set_current_overload<iris_overload_cast<iris::iris_coroutine_t<int>, const std::string&, int>(&example_t::coro_get_int)>("coro_get_int");
@@ -377,9 +378,18 @@ struct example_t : example_base_t {
 	}
 #endif
 
+	std::string_view get_prop_value() const {
+		return prop_value;
+	}
+
+	void set_prop_value(std::string&& value) {
+		prop_value = std::move(value);
+	}
+
 	int value = 10;
 	const int const_value = 0;
 	int value_as_const = 2;
+	std::string prop_value = "base prop value";
 };
 
 struct shared_data_t : std::enable_shared_from_this<shared_data_t> {
@@ -642,6 +652,9 @@ function test(a, b, c) \n\
 	b:base_func() \n\
 	b:base_bind() \n\
 	b.base_bind_static() \n\
+	b.prop_value = 'new prop value' \n\
+	print('prop value: ' .. b.prop_value) \n\
+	assert(b.prop_value == 'new prop value') \n\
 	b:crtp_foo() \n\
 	print('equal value ======== ' .. tostring(b == c)) \n\
 	print('base value ======== ' .. tostring(b.base_value)) \n\

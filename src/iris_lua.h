@@ -1643,70 +1643,6 @@ namespace iris {
 			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter), std::forward<setter_t>(setter));
 		}
 
-		template <typename key_t, typename getter_t, typename... setter_t>
-		reflection_t set_current_prop_functor_internal(key_t&& key, getter_t&& getter, setter_t&&... setter) {
-			using getter_value_t = remove_cvref_t<getter_t>;
-			static_assert(is_functor<getter_value_t>::value, "A property getter must be a functor with operator ().");
-			static_assert(std::is_class_v<getter_value_t>, "Use the set_current_prop<&getter, &setter>(name) form for plain function pointers.");
-
-			using getter_traits_t = functor_property_traits_t<decltype(&getter_value_t::operator ())>;
-			static_assert(getter_traits_t::arg_count == 1, "A property getter functor must take the owner as its only parameter.");
-			static_assert(!std::is_void_v<typename getter_traits_t::result>, "A property getter must not return void.");
-
-			using owner_t = functor_property_owner_t<getter_value_t>;
-			static_assert(std::is_class_v<owner_t>, "The first parameter of a property functor must be a pointer or reference to the owner class.");
-
-			if constexpr (sizeof...(setter_t) != 0) {
-				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
-				static_assert(sizeof...(setter_t) == 1, "Only one setter functor is allowed.");
-				static_assert(is_functor<setter_value_t>::value, "A property setter must be a functor with operator ().");
-
-				using setter_traits_t = functor_property_traits_t<decltype(&setter_value_t::operator ())>;
-				static_assert(setter_traits_t::arg_count == 2, "A property setter functor must take the owner and exactly one value parameter.");
-				static_assert(std::is_same_v<std::remove_cv_t<functor_property_owner_t<setter_value_t>>, std::remove_cv_t<owner_t>>, "Getter and setter functors must share the same owner type.");
-			}
-
-			auto guard = write_fence();
-
-			lua_State* L = state;
-			stack_guard_t stack_guard(L);
-
-			// __get entry: closure holding the getter functor as upvalue
-			lua_pushliteral(L, "__get");
-			lua_rawget(L, -2);
-			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
-
-			push_variable(L, std::forward<key_t>(key));
-			push_property_functor(L, std::forward<getter_t>(getter));
-			lua_pushcclosure(L, &iris_lua_t::property_functor_get_proxy<owner_t, getter_value_t>, 1);
-			lua_rawset(L, -3);
-			lua_pop(L, 1);
-
-			if constexpr (sizeof...(setter_t) != 0) {
-				lua_pushliteral(L, "__set");
-				lua_rawget(L, -2);
-				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
-
-				push_variable(L, key);
-				push_property_functor(L, std::forward<setter_t>(setter)...);
-				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
-				lua_pushcclosure(L, &iris_lua_t::property_functor_set_proxy<functor_property_owner_t<setter_value_t>, setter_value_t>, 1);
-				lua_rawset(L, -3);
-				lua_pop(L, 1);
-			} else {
-				lua_pushliteral(L, "__set");
-				lua_rawget(L, -2);
-				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
-
-				push_variable(L, key);
-				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
-				lua_rawset(L, -3);
-				lua_pop(L, 1);
-			}
-
-			return nullptr;
-		}
-
 		template <auto ptr, typename key_t, typename... envs_t>
 		reflection_t set_current_new(key_t&& key, envs_t&&... envs) {
 			return set_current_new_internal<ptr>(ptr, std::forward<key_t>(key), std::forward<envs_t>(envs)...);
@@ -2012,6 +1948,70 @@ namespace iris {
 		}
 
 	protected:
+		template <typename key_t, typename getter_t, typename... setter_t>
+		reflection_t set_current_prop_functor_internal(key_t&& key, getter_t&& getter, setter_t&&... setter) {
+			using getter_value_t = remove_cvref_t<getter_t>;
+			static_assert(is_functor<getter_value_t>::value, "A property getter must be a functor with operator ().");
+			static_assert(std::is_class_v<getter_value_t>, "Use the set_current_prop<&getter, &setter>(name) form for plain function pointers.");
+
+			using getter_traits_t = functor_property_traits_t<decltype(&getter_value_t::operator ())>;
+			static_assert(getter_traits_t::arg_count == 1, "A property getter functor must take the owner as its only parameter.");
+			static_assert(!std::is_void_v<typename getter_traits_t::result>, "A property getter must not return void.");
+
+			using owner_t = functor_property_owner_t<getter_value_t>;
+			static_assert(std::is_class_v<owner_t>, "The first parameter of a property functor must be a pointer or reference to the owner class.");
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				static_assert(sizeof...(setter_t) == 1, "Only one setter functor is allowed.");
+				static_assert(is_functor<setter_value_t>::value, "A property setter must be a functor with operator ().");
+
+				using setter_traits_t = functor_property_traits_t<decltype(&setter_value_t::operator ())>;
+				static_assert(setter_traits_t::arg_count == 2, "A property setter functor must take the owner and exactly one value parameter.");
+				static_assert(std::is_same_v<std::remove_cv_t<functor_property_owner_t<setter_value_t>>, std::remove_cv_t<owner_t>>, "Getter and setter functors must share the same owner type.");
+			}
+
+			auto guard = write_fence();
+
+			lua_State* L = state;
+			stack_guard_t stack_guard(L);
+
+			// __get entry: closure holding the getter functor as upvalue
+			lua_pushliteral(L, "__get");
+			lua_rawget(L, -2);
+			IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+			push_variable(L, std::forward<key_t>(key));
+			push_property_functor(L, std::forward<getter_t>(getter));
+			lua_pushcclosure(L, &iris_lua_t::property_functor_get_proxy<owner_t, getter_value_t>, 1);
+			lua_rawset(L, -3);
+			lua_pop(L, 1);
+
+			if constexpr (sizeof...(setter_t) != 0) {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				push_property_functor(L, std::forward<setter_t>(setter)...);
+				using setter_value_t = remove_cvref_t<std::tuple_element_t<0, std::tuple<setter_t...>>>;
+				lua_pushcclosure(L, &iris_lua_t::property_functor_set_proxy<functor_property_owner_t<setter_value_t>, setter_value_t>, 1);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			} else {
+				lua_pushliteral(L, "__set");
+				lua_rawget(L, -2);
+				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
+
+				push_variable(L, key);
+				lua_pushcclosure(L, &iris_lua_t::property_readonly_set_proxy, 0);
+				lua_rawset(L, -3);
+				lua_pop(L, 1);
+			}
+
+			return nullptr;
+		}
+
 		template <auto ptr, typename return_t, typename key_t, typename type_t, typename... args_t, typename... envs_t>
 		reflection_t set_current_new_internal(return_t (*)(iris_lua_t, type_t*, args_t...), key_t&& key, envs_t&&... envs) {
 			auto guard = write_fence();
