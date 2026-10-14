@@ -1269,8 +1269,8 @@ pattern 7. Runnable demo: `co_await:tutorial_manager():run()` (module
 | [src/iris_system.h](src/iris_system.h) | System integration utilities |
 | [src/iris_tree.h](src/iris_tree.h) | Tree data structures |
 | [test/iris_dispatcher_demo.cpp](test/iris_dispatcher_demo.cpp) | Warp system and DAG dispatcher examples |
-| [test/iris_coroutine_demo.cpp](test/iris_coroutine_demo.cpp) | C++ coroutine examples |
-| [test/iris_lua_demo.cpp](test/iris_lua_demo.cpp) | Lua binding examples |
+| [test/iris_coroutine_demo.cpp](test/iris_coroutine_demo.cpp) | C++ coroutine examples + concurrency stress tests (barrier/quota/pipe races, watchdog-guarded) |
+| [test/iris_lua_demo.cpp](test/iris_lua_demo.cpp) | Lua binding examples: traits/bindings, cross-VM transfer, encode/decode, coroutines, proxy views (incl. queue/heap container faces), shared elements |
 | [tutorial/lua_co_await/](tutorial/lua_co_await/) | Full Lua + coroutine integration tutorial: 16 runnable modules + docs (see [Tutorials](#tutorials)) |
 | [tutorial/lua_co_await/docs/](tutorial/lua_co_await/docs/) | Tutorial docs: instructions, design principles, architecture, workflows, framework patterns |
 | [tutorial/lua_event_framework/](tutorial/lua_event_framework/) | Event-driven framework tutorial: receive events → forward to workers → poll results in a non-blocking Lua-side event loop (zero external dependencies, with docs) |

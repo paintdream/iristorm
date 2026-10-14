@@ -141,6 +141,10 @@ IF (ENABLE_COROUTINE)
 	ADD_EXECUTABLE (iris_coroutine_demo ${IRIS_COROUTINE_DEMO_SRC})
 	IRIS_ADD_TEST (test_coroutine iris_coroutine_demo)
 
+	IF (EMSCRIPTEN)
+		TARGET_LINK_OPTIONS (iris_coroutine_demo PRIVATE "SHELL:-s INITIAL_MEMORY=67108864")
+	ENDIF (EMSCRIPTEN)
+
 	IF (NOT MSVC)
 		TARGET_LINK_LIBRARIES (iris_coroutine_demo m ${STDLIB} pthread)
 	ENDIF (NOT MSVC)
@@ -158,25 +162,6 @@ IF (ENABLE_COROUTINE)
 
 	IF (NOT MSVC)
 		TARGET_LINK_LIBRARIES (iris_engine_demo m ${STDLIB} pthread)
-	ENDIF (NOT MSVC)
-
-	FILE (GLOB_RECURSE IRIS_COROUTINE_STRESS_SRC
-		"${PROJECT_SOURCE_DIR}/src/iris_common.h"
-		"${PROJECT_SOURCE_DIR}/src/iris_common.inl"
-		"${PROJECT_SOURCE_DIR}/src/iris_dispatcher.h"
-		"${PROJECT_SOURCE_DIR}/src/iris_coroutine.h"
-		"${PROJECT_SOURCE_DIR}/test/iris_coroutine_stress.cpp"
-	)
-
-	ADD_EXECUTABLE (iris_coroutine_stress ${IRIS_COROUTINE_STRESS_SRC})
-	IRIS_ADD_TEST (test_coroutine_stress iris_coroutine_stress)
-
-	IF (EMSCRIPTEN)
-		TARGET_LINK_OPTIONS (iris_coroutine_stress PRIVATE "SHELL:-s INITIAL_MEMORY=67108864")
-	ENDIF (EMSCRIPTEN)
-
-	IF (NOT MSVC)
-		TARGET_LINK_LIBRARIES (iris_coroutine_stress m ${STDLIB} pthread)
 	ENDIF (NOT MSVC)
 ENDIF (ENABLE_COROUTINE)
 
@@ -242,48 +227,6 @@ IF (ENABLE_LUA)
 		TARGET_LINK_LIBRARIES (iris_lua_demo ${LUALIB})
 	ELSE (MSVC)
 		TARGET_LINK_LIBRARIES (iris_lua_demo m ${STDLIB} ${LUALIB})
-	ENDIF (MSVC)
-
-	FILE (GLOB_RECURSE IRIS_LUA_PROXY_DEMO_SRC
-		"${PROJECT_SOURCE_DIR}/src/iris_lua.h"
-		"${PROJECT_SOURCE_DIR}/test/iris_lua_proxy_demo.cpp"
-	)
-
-	ADD_EXECUTABLE (iris_lua_proxy_demo ${IRIS_LUA_PROXY_DEMO_SRC} ${IRIS_LUA_CORE_SRC})
-
-	IF (NOT ENABLE_LUA_BUILTIN)
-		TARGET_INCLUDE_DIRECTORIES (iris_lua_proxy_demo PUBLIC ${LUA_INCLUDE_DIR})
-		TARGET_COMPILE_DEFINITIONS (iris_lua_proxy_demo PUBLIC USE_LUA_LIBRARY)
-	ENDIF (NOT ENABLE_LUA_BUILTIN)
-
-	TARGET_COMPILE_DEFINITIONS (iris_lua_proxy_demo PRIVATE LUAI_ASSERT)
-	IRIS_ADD_TEST (test_lua_proxy iris_lua_proxy_demo)
-
-	IF (MSVC)
-		TARGET_LINK_LIBRARIES (iris_lua_proxy_demo ${LUALIB})
-	ELSE (MSVC)
-		TARGET_LINK_LIBRARIES (iris_lua_proxy_demo m ${STDLIB} ${LUALIB})
-	ENDIF (MSVC)
-
-	FILE (GLOB_RECURSE IRIS_LUA_QUEUE_DEMO_SRC
-		"${PROJECT_SOURCE_DIR}/src/iris_lua.h"
-		"${PROJECT_SOURCE_DIR}/test/iris_lua_queue_demo.cpp"
-	)
-
-	ADD_EXECUTABLE (iris_lua_queue_demo ${IRIS_LUA_QUEUE_DEMO_SRC} ${IRIS_LUA_CORE_SRC})
-
-	IF (NOT ENABLE_LUA_BUILTIN)
-		TARGET_INCLUDE_DIRECTORIES (iris_lua_queue_demo PUBLIC ${LUA_INCLUDE_DIR})
-		TARGET_COMPILE_DEFINITIONS (iris_lua_queue_demo PUBLIC USE_LUA_LIBRARY)
-	ENDIF (NOT ENABLE_LUA_BUILTIN)
-
-	TARGET_COMPILE_DEFINITIONS (iris_lua_queue_demo PRIVATE LUAI_ASSERT)
-	IRIS_ADD_TEST (test_lua_queue iris_lua_queue_demo)
-
-	IF (MSVC)
-		TARGET_LINK_LIBRARIES (iris_lua_queue_demo ${LUALIB})
-	ELSE (MSVC)
-		TARGET_LINK_LIBRARIES (iris_lua_queue_demo m ${STDLIB} ${LUALIB})
 	ENDIF (MSVC)
 ENDIF (ENABLE_LUA)
 
