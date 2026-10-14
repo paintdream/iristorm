@@ -276,7 +276,7 @@ struct proxy_view_t {
 器、唯一遍历是破坏性 pop，语义不成立；队列交互全部经 proxy 完成，`__set` 的 table 赋值
 分支（clear + push）是唯一"从 table 重建"入口。
 
-测试覆盖（`test/iris_lua_queue_demo.cpp`）：
+测试覆盖（`test/iris_lua_demo.cpp` 的 `test_queue_faces`，2026-10 与 proxy/shared-element 子测试合并进单一 lua demo 工程）：
 
 - `std::queue` / `std::priority_queue`：push/pop/front/back/top、`#`、空容器 `pop/front/top`
   报错、clone、table 与 proxy 两种整体赋值、元素赋值报错、const 成员只读视图；
@@ -329,10 +329,10 @@ struct proxy_view_t {
    （版本分派宿主锚定、registry 类型惰性注册、`a.vector = proxy_or_table` 整体赋值）；
 3. ✅ map 与 vector 双面貌（sequence/map 分派、方法不遮蔽数据键、`clone` 拥有型 proxy、
    `keys/values/items` 快照迭代、负索引、越界与类型错误）；
-4. ✅ `test/iris_lua_proxy_demo.cpp`（MSVC 19.16 / C++17 与 C++20+协程模式编译通过，
+4. ✅ `test/iris_lua_demo.cpp` 的 `test_proxy_views`（MSVC 19.16 / C++17 与 C++20+协程模式编译通过，
    **Lua 5.5、Lua 5.1.5、LuaJIT 2.1（OpenResty rolling）三环境全断言通过**：
    5.1/LuaJIT 实测了 ≤5.3 的 registry ref 锚定路径；原有 `iris_lua_demo` 回归通过）。
-   CMake target `iris_lua_proxy_demo` 已加。
+   CMake target `iris_lua_demo`（`test_lua`）已加。
    注：iris_lua.h 补了一个 vanilla 5.1 缺口 shim：`luaL_loadbufferx` → `luaL_loadbuffer`
    （5.2+ API，库的 `load()` 无条件调用；门控 `!defined(LUAJIT_VERSION)` —— LuaJIT 虽是
    `LUA_VERSION_NUM 501` 但自带 `luaL_loadbufferx`，shim 必须避开它以免丢 mode 参数）；
@@ -346,9 +346,9 @@ struct proxy_view_t {
      如 `map<string, row_t>` + `row_t::values`。将来若真有刚需，加显式 opt-in 的
      `row_view(i)`（文档写明失效规则），不让 `[]` 隐式返回 view。
 6. ✅ v2：queue/heap 面貌（§5.2）—— std::queue / std::priority_queue / iris_queue_list_t
-   三容器经 `set_current_proxy` 接入；`test/iris_lua_queue_demo.cpp`
-   （CMake target `iris_lua_queue_demo`），MSVC 2026 / Lua 5.5 编译运行通过；
-   `iris_lua_proxy_demo` / `iris_lua_demo` 回归通过。附带修复 v1 缺陷：
+   三容器经 `set_current_proxy` 接入；`test/iris_lua_demo.cpp` 的 `test_queue_faces`
+   （CMake target `iris_lua_demo` / `test_lua`），MSVC 2026 / Lua 5.5 编译运行通过；
+   proxy / shared-element 子测试在同一工程内回归通过。附带修复 v1 缺陷：
    `set_current_proxy` 未按 `is_copy_assignable_v` 门控 `__set` 注册（move-only 成员
    编译失败），与 §4.1 声明不符。
 

@@ -65,7 +65,7 @@
 1. 修 `set_current_proxy` 的 `__set` 拷贝赋值门控（前置缺陷，独立提交）；
 2. proxy_view_t 新增 queue 面貌与 heap 面貌（固定契约：queue = `front/back/push/pop/size/empty/clear(循环)/clone(门控)`；heap = `top/push/pop/size/empty/clear(循环)/clone(门控)`），`__len` 转发 size，`__index`/`__newindex` 不注册数据键、写路径报错，pop/front/top 空检查报 `error.exec`；
 3. `iris_queue_list_t` 加 `value_type`/`front()` 别名后按 queue 面貌接入（back 不提供，文档标注），可选：用 `get(i)` 额外暴露只读整数索引（需自行做范围检查 + 并发标注）；
-4. demo：扩展 `test/iris_lua_proxy_demo.cpp`（或新 demo）覆盖三容器 × {push/pop/front|top/empty/clear/clone/整体赋值}，沿用三环境（5.5 / 5.1.5 / LuaJIT）回归矩阵；
+4. demo：扩展 `test/iris_lua_demo.cpp`（`test_queue_faces` 子测试）覆盖三容器 × {push/pop/front|top/empty/clear/clone/整体赋值}，沿用三环境（5.5 / 5.1.5 / LuaJIT）回归矩阵；
 5. 文档：`design_set_current_proxy.md` 增补 queue/heap 面貌契约与 queue_list 的并发声明（push/pop 跨 warp 合法，size/get/clear 单线程）。
 
 方法命名注意沿用现有约定：避开 `lua_insert` 等 Lua 头文件宏（设计文档实现备注），`push`/`pop`/`front`/`top` 均安全。
