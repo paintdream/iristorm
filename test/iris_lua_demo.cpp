@@ -729,6 +729,48 @@ end\n\
 	int result2 = target.native_call(std::move(test2), 0).value();
 	target.native_cross_transfer_variable<true>(lua, -1);
 	target.native_pop_variable(1);
+
+	// a cycle through function upvalues has no registry entry to stop it, crossing it
+	// must terminate at the depth guard (nil on the target plus a systrap report)
+	// instead of exhausting the native stack
+	{
+		auto callResultCycle = lua.call<void>(lua.load("\n\
+	function make_cycle() \n\
+		local a, b \n\
+		a = function() return b end \n\
+		b = function() return a end \n\
+		return { a = a, b = b } \n\
+	end\n").value());
+		if (!callResultCycle) {
+			fprintf(stderr, "Lua code error: %s\n", callResultCycle.message.c_str());
+			IRIS_ASSERT(false);
+		}
+
+		// count the expected depth guard report instead of spilling it to stderr
+		int systrap_hits = 0;
+		lua_State* L = lua.get_state();
+		lua_pushliteral(L, "__iris_systrap__");
+		lua_pushlightuserdata(L, &systrap_hits);
+		lua_pushcclosure(L, [](lua_State* S) -> int {
+			++*static_cast<int*>(lua_touserdata(S, lua_upvalueindex(1)));
+			return 0;
+		}, 1);
+		lua_rawset(L, LUA_REGISTRYINDEX);
+
+		auto make_cycle = lua.get_global<lua_t::ref_t>("make_cycle");
+		auto resultCycle = lua.native_call(std::move(make_cycle), 0);
+		IRIS_ASSERT(resultCycle);
+		lua.native_cross_transfer_variable<true>(target, -1);
+		IRIS_ASSERT(lua_type(T, -1) == LUA_TTABLE);
+		IRIS_ASSERT(systrap_hits > 0);
+		target.native_pop_variable(1);
+		lua.native_pop_variable(1);
+
+		// drop the temporary systrap hook
+		lua_pushliteral(L, "__iris_systrap__");
+		lua_pushnil(L);
+		lua_rawset(L, LUA_REGISTRYINDEX);
+	}
 	lua_close(T);
 
 	auto callResult2 = lua.call<void>(lua.load("\n\

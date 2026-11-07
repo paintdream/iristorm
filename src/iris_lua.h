@@ -4177,11 +4177,37 @@ namespace iris {
 		}
 
 		// transfer a variable between different states
+		//
+		// only tables can enter the cycle registry: each table is registered before its
+		// members transfer, so table cycles terminate at the registry lookup. functions
+		// cannot be registered: lua closures are rebuilt from a bytecode dump, C closures
+		// are recreated from transferred upvalue values, neither shares identity with the
+		// source. a cycle through function upvalues therefore recurses without bound, and
+		// cross_transfer_max_depth is the only guard against it: past the limit the value
+		// transfers as nil with a systrap report instead of a native stack overflow.
+		// _ENV upvalues are replaced with the target's own globals table - the source
+		// state's globals table is never transferred.
+		static constexpr int cross_transfer_max_depth = 64;
 		template <bool move, typename lua_t>
-		static int cross_transfer_variable(lua_State* L, lua_t& target, int index, int recursion_source, int recursion_target, int recursion_index) {
+		static int cross_transfer_variable(lua_State* L, lua_t& target, int index, int recursion_source, int recursion_target, int recursion_index, int depth = 0) {
 			stack_guard_t guard(L);
 			lua_State* T = target.get_state();
 			stack_guard_t guard_target(T, 1);
+			// each recursion level leaves values on both stacks (held upvalues on L,
+			// rebuilt closures on T, the nil from the depth guard), so both frame
+			// budgets must grow with the depth
+			lua_checkstack(L, 8);
+			lua_checkstack(T, 8);
+
+			// no registry entry can stop a cycle through function upvalues: past the
+			// limit the value transfers as nil instead of exhausting the native stack
+			if (depth > cross_transfer_max_depth) {
+				target.native_push_variable(nullptr);
+				systrap(L, "error.cross", "cross_transfer_variable() -> crossing depth limit exceeded (cross_transfer_max_depth = %d); "
+					"the value graph likely contains a cycle through function upvalues, which cannot be transferred - "
+					"the target receives nil for this value\n", cross_transfer_max_depth);
+				return recursion_index;
+			}
 
 			int type = lua_type(L, index);
 			switch (type) {
@@ -4251,8 +4277,8 @@ namespace iris {
 					lua_checkstack(L, 4);
 					while (lua_next(L, absindex) != 0) {
 						// since we do not allow implicit lua_tostring conversion, so it's safe to extract key without duplicating it
-						recursion_index = cross_transfer_variable<move>(L, target, -2, recursion_source, recursion_target, recursion_index);
-						recursion_index = cross_transfer_variable<move>(L, target, -1, recursion_source, recursion_target, recursion_index);
+						recursion_index = cross_transfer_variable<move>(L, target, -2, recursion_source, recursion_target, recursion_index, depth + 1);
+						recursion_index = cross_transfer_variable<move>(L, target, -1, recursion_source, recursion_target, recursion_index, depth + 1);
 						lua_rawset(T, -3);
 						lua_pop(L, 1);
 					}
@@ -4263,13 +4289,22 @@ namespace iris {
 				{
 					if (lua_iscfunction(L, index)) {
 						lua_CFunction proxy = lua_tocfunction(L, index);
-						// copy upvalues
+						// replace _ENV with the target's own globals table, same as the lua closure path
 						int absindex = lua_absindex(L, index);
 						int n = 1;
 
 						lua_checkstack(L, 4);
-						while (lua_getupvalue(L, absindex, n) != nullptr) {
-							recursion_index = cross_transfer_variable<false>(L, target, -1, recursion_source, recursion_target, recursion_index);
+						const char* upname = nullptr;
+						while ((upname = lua_getupvalue(L, absindex, n)) != nullptr) {
+							if (strcmp(upname, "_ENV") == 0) {
+#if LUA_VERSION_NUM >= 502
+								lua_pushglobaltable(T);
+#else
+								lua_pushvalue(T, LUA_GLOBALSINDEX);
+#endif
+							} else {
+								recursion_index = cross_transfer_variable<false>(L, target, -1, recursion_source, recursion_target, recursion_index, depth + 1);
+							}
 							lua_pop(L, 1);
 							n++;
 						}
@@ -4325,7 +4360,7 @@ namespace iris {
 								lua_pushvalue(T, LUA_GLOBALSINDEX);
 #endif
 							} else {
-								recursion_index = cross_transfer_variable<false>(L, target, -1, recursion_source, recursion_target, recursion_index);
+								recursion_index = cross_transfer_variable<false>(L, target, -1, recursion_source, recursion_target, recursion_index, depth + 1);
 							}
 
 							lua_setupvalue(T, -2, n);
@@ -4353,7 +4388,7 @@ namespace iris {
 						}
 					} else {
 						stack_guard_t guard(T, 1);
-						if (cross_transfer_metatable(L, target, recursion_source, recursion_target, recursion_index) != -1) {
+						if (cross_transfer_metatable(L, target, recursion_source, recursion_target, recursion_index, depth) != -1) {
 							size_t rawlen = static_cast<size_t>(lua_rawlen(L, absindex));
 							if (rawlen & size_mask_view) {
 								lua_pushliteral(T, "__view");
@@ -4419,7 +4454,7 @@ namespace iris {
 
 	protected:
 		template <typename lua_t>
-		static int cross_transfer_metatable(lua_State* L, lua_t& target, int recursion_source, int recursion_target, int recursion_index) {
+		static int cross_transfer_metatable(lua_State* L, lua_t& target, int recursion_source, int recursion_target, int recursion_index, int depth) {
 			stack_guard_t guard(L);
 			lua_State* T = target.get_state();
 
@@ -4443,11 +4478,11 @@ namespace iris {
 					lua_pop(T, 1);
 
 					// copy table
-					recursion_index = cross_transfer_variable<false>(L, target, -2, recursion_source, recursion_target, recursion_index);
+					recursion_index = cross_transfer_variable<false>(L, target, -2, recursion_source, recursion_target, recursion_index, depth + 1);
 
 					// copy metatable
 					if (lua_getmetatable(L, -2)) {
-						int new_index = cross_transfer_metatable(L, target, recursion_source, recursion_target, recursion_index);
+						int new_index = cross_transfer_metatable(L, target, recursion_source, recursion_target, recursion_index, depth + 1);
 						if (new_index != -1) {
 							recursion_index = new_index;
 							lua_setmetatable(T, -2);
