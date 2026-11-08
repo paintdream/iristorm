@@ -33,6 +33,7 @@ SOFTWARE.
 
 // C++20 coroutine support
 #include <coroutine>
+#include <optional>
 #include <vector>
 
 // Coroutine fiber profiling is profiler-agnostic: iris only invokes the
@@ -109,10 +110,14 @@ namespace iris {
 	//   destroyed and *with* its return value bound to a parameter that
 	//   outlives the call.  Consequences:
 	//     * Inside `completion`, you may safely read the return value and
-	//       resume the parent coroutine synchronously (the default chaining
-	//       path in await_suspend() does exactly this -- the parent's
-	//       await_resume() runs while the child's return slot is still
-	//       alive).
+	//       invoke other code synchronously. User complete()/then() callbacks
+	//       still run before the child's local variables are destroyed.
+	//     * co_await moves the result into the parent awaiter. If the child
+	//       completes during await_suspend(), the parent continues without
+	//       suspension after run() returns, rather than recursively resuming
+	//       from completion. Otherwise completion resumes the suspended
+	//       parent inline in the existing scheduler context. No extra queue
+	//       or warp acquisition is introduced by coroutine chaining.
 	//     * You MUST NOT capture a reference to anything on the coroutine
 	//       frame (locals, the return value, etc.) and stash it for use after
 	//       `completion` returns.  By the time control unwinds out of
@@ -212,7 +217,7 @@ namespace iris {
 		}
 
 		// chain execution
-		void await_suspend(std::coroutine_handle<> parent_handle) {
+		bool await_suspend(std::coroutine_handle<> parent_handle) {
 			// Fiber of the PARENT coroutine: the completion callback below
 			// resumes the parent from inside THIS coroutine's completion (a
 			// nested resume), so it must switch to the parent's fiber lane for
@@ -220,32 +225,37 @@ namespace iris {
 			const char* parentFiber = IRIS_PROFILE_COROUTINE_CURRENT();
 			if constexpr (!std::is_void_v<return_t>) {
 				complete([this, parent_handle = std::move(parent_handle), parentFiber](void*, return_t&& value) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
-					await_result = &value;
-					// Locals (not the enclosing captures): MSVC cannot reference
-					// an enclosing lambda's captures from a nested lambda.
-					std::coroutine_handle<> handle = parent_handle;
-					const char* fiber = parentFiber;
-					IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
-					handle.resume();
+					await_result.emplace(std::move(value));
+					if (await_handshake.exchange(true, std::memory_order_acq_rel)) {
+						// Resuming may destroy this awaiter; do not access it afterwards.
+						std::coroutine_handle<> handle = parent_handle;
+						const char* fiber = parentFiber;
+						IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
+						handle.resume();
+					}
 				});
 			} else {
 				complete([this, parent_handle = std::move(parent_handle), parentFiber](void*) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
-					std::coroutine_handle<> handle = parent_handle;
-					const char* fiber = parentFiber;
-					IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
-					handle.resume();
+					if (await_handshake.exchange(true, std::memory_order_acq_rel)) {
+						std::coroutine_handle<> handle = parent_handle;
+						const char* fiber = parentFiber;
+						IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
+						handle.resume();
+					}
 				});
 			}
 
 			run();
+			// The first side publishes completion/suspension; the second proceeds.
+			// After publication completion may destroy this awaiter on another thread.
+			return !await_handshake.exchange(true, std::memory_order_acq_rel);
 		}
 
 		// carry out return value
 		return_t await_resume() noexcept {
 			if constexpr (!std::is_void_v<return_t>) {
-				IRIS_ASSERT(await_result != nullptr);
-				return_t* p = await_result;
-				return std::move(*p);
+				IRIS_ASSERT(await_result.has_value());
+				return std::move(*await_result);
 			}
 		}
 
@@ -270,8 +280,10 @@ namespace iris {
 		}
 
 	protected:
+		struct void_t {};
 		std::coroutine_handle<promise_type> handle;
-		return_t* await_result = nullptr;
+		std::conditional_t<std::is_void_v<return_t>, void_t, std::optional<return_t>> await_result;
+		std::atomic<bool> await_handshake{ false };
 	};
 	// awaitable object, can be used by:
 	// co_await iris_awaitable_t(...);
@@ -340,8 +352,7 @@ namespace iris {
 					ret = func(); // auto moved here
 				}
 
-				status.fetch_or(status_mask_completed, std::memory_order_release);
-				if (resume_handle != std::coroutine_handle()) {
+				if (status.fetch_or(status_mask_completed, std::memory_order_release) & status_mask_waited) {
 					auto handle = std::exchange(resume_handle, std::coroutine_handle());
 					IRIS_PROFILE_COROUTINE_RESUME(handle, coro_identifier);
 					handle.resume();
@@ -407,17 +418,21 @@ namespace iris {
 			return true;
 		}
 
-		void await_suspend(std::coroutine_handle<> handle) {
+		bool await_suspend(std::coroutine_handle<> handle) {
 			// Fiber of the awaiting coroutine: the eventual resume (in
 			// resume_one, from a worker/warp task) re-enters this fiber.
 			coro_identifier = IRIS_PROFILE_COROUTINE_CURRENT();
 			resume_handle = std::move(handle);
 
-			if (status.fetch_or(status_mask_waited, std::memory_order_release) & status_mask_completed) {
-				resume_one();
-			} else {
-				dispatch();
+			dispatch();
+			// Dispatch can complete inline. Publish the waiter only afterwards so
+			// that synchronous completion cannot recursively resume this coroutine.
+			if (status.fetch_or(status_mask_waited, std::memory_order_acq_rel) & status_mask_completed) {
+				resume_handle = std::coroutine_handle<>();
+				return false;
 			}
+
+			return true;
 		}
 
 		return_t await_resume() noexcept {

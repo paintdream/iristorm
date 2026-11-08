@@ -350,6 +350,21 @@ int result = co_await cascade_ret(warp);
 // result == 1234
 ```
 
+Synchronous child coroutines and same-warp `iris_awaitable` tasks continue inline
+without recursively calling the parent's `resume()`. This keeps the native stack
+bounded across long sequences of synchronous `co_await`s; it does not eliminate
+the stack needed to start genuinely nested child coroutines. Coroutine results
+are moved into storage owned by the parent awaiter, so they remain valid after
+the child frame is destroyed. For a synchronously completed child, its local
+variables are destroyed before the parent continues.
+
+Asynchronous completion keeps the existing scheduling rules: cross-warp work and
+warp-less return paths are queued/posted, while warp-pair continuations run inline
+inside their acquisition guards. Chaining itself adds no scheduler hop or
+thread-local continuation queue. User `complete()`/`then()` callbacks still run
+inline before the child's local variables are destroyed; references to those
+locals must not escape the callback.
+
 Additional coroutine utilities include:
 
 - **iris_barrier_t**: synchronization barrier for N coroutines
@@ -1274,4 +1289,3 @@ pattern 7. Runnable demo: `co_await:tutorial_manager():run()` (module
 | [tutorial/lua_co_await/](tutorial/lua_co_await/) | Full Lua + coroutine integration tutorial: 16 runnable modules + docs (see [Tutorials](#tutorials)) |
 | [tutorial/lua_co_await/docs/](tutorial/lua_co_await/docs/) | Tutorial docs: instructions, design principles, architecture, workflows, framework patterns |
 | [tutorial/lua_event_framework/](tutorial/lua_event_framework/) | Event-driven framework tutorial: receive events → forward to workers → poll results in a non-blocking Lua-side event loop (zero external dependencies, with docs) |
-

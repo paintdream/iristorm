@@ -3,8 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -33,6 +36,10 @@ static void test_pipe_spsc_race();
 static void test_dispatcher_next_handle();
 static void test_warp_suspend_resume_storm();
 static void test_event_cycle();
+static void test_inline_completion_chains();
+static void test_coroutine_completion_lifetime();
+static void test_coroutine_warp_context();
+static void test_coroutine_completion_race();
 
 static coroutine_t cascade(warp_t* warp) {
 	warp_t* w = co_await iris_switch(warp);
@@ -337,17 +344,360 @@ static bool run_with_timeout(const char* name, std::chrono::milliseconds ms, fn_
 	std::promise<void> done;
 	std::future<void> fut = done.get_future();
 	std::thread([&]() {
-		try { fn(); } catch (...) {}
-		done.set_value();
+		try {
+			fn();
+			done.set_value();
+		} catch (...) {
+			done.set_exception(std::current_exception());
+		}
 	}).detach();
 
 	auto status = fut.wait_for(ms);
 	if (status == std::future_status::ready) {
+		try {
+			fut.get();
+		} catch (const std::exception& e) {
+			printf("[FAIL] %s: %s\n", name, e.what());
+			return false;
+		} catch (...) {
+			printf("[FAIL] %s: unknown exception\n", name);
+			return false;
+		}
 		printf("[PASS] %s\n", name);
 		return true;
 	}
 	printf("[FAIL/HANG] %s (exceeded %lld ms)\n", name, (long long)ms.count());
 	return false;
+}
+
+struct coroutine_stack_sample_t {
+	std::uintptr_t low = 0;
+	std::uintptr_t high = 0;
+	size_t count = 0;
+	size_t fiber_errors = 0;
+
+	size_t span() const { return static_cast<size_t>(high - low); }
+};
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void sample_coroutine_stack(coroutine_stack_sample_t& sample) {
+	volatile unsigned char marker = 0;
+	auto address = reinterpret_cast<std::uintptr_t>(&marker);
+	if (sample.count++ == 0) {
+		sample.low = sample.high = address;
+	} else {
+		sample.low = std::min(sample.low, address);
+		sample.high = std::max(sample.high, address);
+	}
+}
+
+static coroutine_t inline_child(coroutine_stack_sample_t& sample) {
+	sample_coroutine_stack(sample);
+	co_return;
+}
+
+static coroutine_t inline_completion_chain(coroutine_stack_sample_t& sample, size_t count, bool task) {
+	for (size_t i = 0; i < count; i++) {
+		if (task) {
+			co_await iris_awaitable(warp_t::get_current(), [&sample]() { sample_coroutine_stack(sample); });
+		} else {
+			co_await inline_child(sample).named("test::inline_child");
+		}
+		const char* fiber = IRIS_PROFILE_COROUTINE_CURRENT();
+		if (fiber != nullptr && std::strcmp(fiber, "test::inline_chain") != 0) {
+			sample.fiber_errors++;
+		}
+	}
+}
+
+static void test_inline_completion_chains() {
+	auto check = []() {
+		for (bool task : { false, true }) {
+			auto measure = [task](size_t count) {
+				coroutine_stack_sample_t sample;
+				bool done = false;
+				inline_completion_chain(sample, count, task).named("test::inline_chain").then([&done]() { done = true; }).run();
+				if (!done || sample.count != count) {
+					throw std::runtime_error("synchronous chain unexpectedly suspended");
+				}
+				if (sample.fiber_errors != 0) {
+					throw std::runtime_error("synchronous chain changed its profiler fiber");
+				}
+				return sample.span();
+			};
+			size_t short_span = measure(32);
+			size_t long_span = measure(256);
+			printf("  %s stack span: 32=%zu, 256=%zu\n", task ? "awaitable" : "coroutine", short_span, long_span);
+			// Check the bound before the large case can overflow an unfixed build.
+			if (long_span > short_span + 16 * 1024 || long_span > 64 * 1024) {
+				throw std::runtime_error("synchronous completion stack grows with chain length");
+			}
+			if (measure(20000) > 64 * 1024) {
+				throw std::runtime_error("long synchronous completion chain exceeded stack budget");
+			}
+		}
+	};
+	check();
+	worker_t worker;
+	worker.append(std::thread());
+	warp_t warp(worker);
+	warp.queue_routine(check);
+}
+
+struct coroutine_local_guard_t {
+	bool& alive;
+	explicit coroutine_local_guard_t(bool& flag) : alive(flag) { alive = true; }
+	~coroutine_local_guard_t() { alive = false; }
+};
+
+struct coroutine_move_value_t {
+	std::unique_ptr<int> value;
+	explicit coroutine_move_value_t(int v) : value(std::make_unique<int>(v)) {}
+	coroutine_move_value_t(coroutine_move_value_t&&) = default;
+	coroutine_move_value_t(const coroutine_move_value_t&) = delete;
+};
+
+static iris_coroutine_t<coroutine_move_value_t> guarded_child(bool& alive, int value) {
+	coroutine_local_guard_t guard(alive);
+	co_return coroutine_move_value_t(value);
+}
+
+static coroutine_t guarded_completion_chain(bool& alive, size_t& errors) {
+	for (int i = 0; i < 20000; i++) {
+		auto value = co_await guarded_child(alive, i);
+		if (alive || !value.value || *value.value != i) {
+			errors++;
+		}
+	}
+}
+
+static void test_coroutine_completion_lifetime() {
+	bool alive = false;
+	bool done = false;
+	size_t errors = 0;
+	guarded_completion_chain(alive, errors).then([&done]() { done = true; }).run();
+	if (!done || alive || errors != 0) {
+		throw std::runtime_error("synchronous co_await result/local lifetime mismatch");
+	}
+	guarded_child(alive, 42).complete([&](void* address, coroutine_move_value_t&& value) {
+		if (!address || !alive || !value.value || *value.value != 42) {
+			errors++;
+		}
+	}).run();
+	guarded_child(alive, 43).then([&](coroutine_move_value_t value) {
+		if (!alive || !value.value || *value.value != 43) {
+			errors++;
+		}
+	}).run();
+	if (alive || errors != 0) {
+		throw std::runtime_error("user completion no longer runs before local destruction");
+	}
+}
+
+static bool warp_is_held(warp_t& warp) {
+	bool acquired = false;
+	std::thread([&]() {
+		warp_t::preempt_guard_t guard(warp, 0);
+		acquired = static_cast<bool>(guard);
+	}).join();
+	return !acquired;
+}
+
+static coroutine_t nested_warp_child(warp_t& warp, coroutine_stack_sample_t& sample, size_t& errors) {
+	co_await inline_child(sample);
+	if (warp_t::get_current() != &warp || !warp_is_held(warp)) {
+		errors++;
+	}
+}
+
+static coroutine_t nested_warp_chain(warp_t& a, warp_t& b, coroutine_stack_sample_t& sample, bool& b_done, size_t& errors) {
+	for (size_t i = 0; i < 32; i++) {
+		co_await inline_child(sample);
+		if (i == 5) {
+			// Anchors the downstream depth-6 TLS trampoline's cross-warp regression.
+			b.queue_routine([&]() {
+				nested_warp_child(b, sample, errors).then([&b_done]() { b_done = true; }).run();
+			});
+		}
+		if (warp_t::get_current() != &a) {
+			errors++;
+		}
+	}
+}
+
+static coroutine_t posted_warp_flow(warp_t& a, warp_t& b, coroutine_stack_sample_t& sample, size_t& errors) {
+	co_await iris_switch(&a);
+	co_await iris_switch(&a);
+	co_await iris_switch(&a, &b);
+	warp_t* paired = warp_t::get_current();
+	co_await inline_child(sample);
+	co_await iris_awaitable(paired, []() {});
+	if ((paired != &a && paired != &b) || warp_t::get_current() != paired || !warp_is_held(a) || !warp_is_held(b)) {
+		errors++;
+	}
+	co_await iris_switch(&a);
+	co_await iris_awaitable(&b, [&]() {
+		if (warp_t::get_current() != &b) {
+			errors++;
+		}
+	});
+	if (warp_t::get_current() != &a) {
+		errors++;
+	}
+	auto predispatched = iris_awaitable(&b, [&]() {
+		if (warp_t::get_current() != &b) {
+			errors++;
+		}
+	});
+	predispatched.dispatch();
+	co_await predispatched;
+	if (warp_t::get_current() != &a) {
+		errors++;
+	}
+	co_await iris_switch<warp_t>(nullptr);
+	co_await iris_awaitable(&b, [&]() {
+		if (warp_t::get_current() != &b) {
+			errors++;
+		}
+	});
+	if (warp_t::get_current() != nullptr) {
+		errors++;
+	}
+}
+
+static coroutine_t queued_awaitable_flow(warp_t& target, warp_t* caller, size_t& work, size_t& errors) {
+	co_await iris_awaitable(&target, [&]() {
+		work++;
+		if (warp_t::get_current() != &target) {
+			errors++;
+		}
+	});
+	if (warp_t::get_current() != caller) {
+		errors++;
+	}
+}
+
+static void test_coroutine_warp_context() {
+	worker_t worker;
+	worker.append(std::thread());
+	worker.start();
+	worker.make_current(0);
+	warp_t a(worker);
+	warp_t b(worker);
+	coroutine_stack_sample_t sample;
+	size_t errors = 0;
+	bool a_done = false;
+	bool b_done = false;
+	a.queue_routine([&]() {
+		nested_warp_chain(a, b, sample, b_done, errors).then([&a_done]() { a_done = true; }).run();
+	});
+	if (!a_done || !b_done || errors != 0 || warp_t::get_current() != nullptr) {
+		throw std::runtime_error("inline continuation escaped its warp acquisition");
+	}
+	bool posted_done = false;
+	posted_warp_flow(a, b, sample, errors).then([&posted_done]() { posted_done = true; }).run();
+	if (posted_done) {
+		throw std::runtime_error("cross-warp switch unexpectedly ran inline");
+	}
+	while (!posted_done) {
+		if (!worker.poll_one()) {
+			throw std::runtime_error("posted warp continuation lost");
+		}
+	}
+	size_t work = 0;
+	bool warp_done = false;
+	bool pool_done = false;
+	queued_awaitable_flow(b, nullptr, work, errors).then([&pool_done]() { pool_done = true; }).run();
+	a.queue_routine([&]() {
+		queued_awaitable_flow(b, &a, work, errors).then([&warp_done]() { warp_done = true; }).run();
+	});
+	if (work != 0 || warp_done || pool_done) {
+		throw std::runtime_error("different-warp awaitable bypassed queue/post");
+	}
+	while (!warp_done || !pool_done) {
+		if (!worker.poll_one()) {
+			throw std::runtime_error("queued awaitable return lost");
+		}
+	}
+	if (work != 2) {
+		throw std::runtime_error("queued awaitable executed more than once");
+	}
+	worker.terminate();
+	worker.join();
+	worker.make_current(~size_t(0));
+	if (errors != 0) {
+		throw std::runtime_error("warp-pair/queued-return scheduling contract violated");
+	}
+}
+
+struct coroutine_thread_resume_t {
+	bool await_ready() const noexcept { return false; }
+	void await_suspend(std::coroutine_handle<> handle) const {
+		// Force completion on another thread before the parent's run() returns.
+		std::thread([handle]() { handle.resume(); }).join();
+	}
+	void await_resume() const noexcept {}
+};
+
+struct coroutine_queued_resume_t {
+	worker_t& worker;
+	bool await_ready() const noexcept { return false; }
+	void await_suspend(std::coroutine_handle<> handle) const {
+		worker.queue([handle]() { handle.resume(); });
+	}
+	void await_resume() const noexcept {}
+};
+
+static iris_coroutine_t<coroutine_move_value_t> concurrent_child(worker_t* worker, int value) {
+	if (worker == nullptr) {
+		co_await coroutine_thread_resume_t();
+	} else {
+		co_await coroutine_queued_resume_t{ *worker };
+	}
+	co_return coroutine_move_value_t(value);
+}
+
+static coroutine_t concurrent_void_child(worker_t* worker, size_t& errors) {
+	auto value = co_await concurrent_child(worker, 42);
+	if (!value.value || *value.value != 42) {
+		errors++;
+	}
+}
+
+static coroutine_t concurrent_completion_chain(worker_t* worker, size_t count, size_t& errors) {
+	for (size_t i = 0; i < count; i++) {
+		auto value = co_await concurrent_child(worker, static_cast<int>(i));
+		if (!value.value || *value.value != static_cast<int>(i) || warp_t::get_current() != nullptr) {
+			errors++;
+		}
+		co_await concurrent_void_child(worker, errors);
+	}
+}
+
+static void test_coroutine_completion_race() {
+	size_t errors = 0;
+	bool early_done = false;
+	concurrent_completion_chain(nullptr, 32, errors).then([&early_done]() { early_done = true; }).run();
+	if (!early_done || errors != 0) {
+		throw std::runtime_error("completion before suspension lost its owned result");
+	}
+	worker_t worker(4);
+	worker.start();
+	std::atomic<bool> done{ false };
+	concurrent_completion_chain(&worker, 20000, errors).then([&done]() { done.store(true, std::memory_order_release); }).run();
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	worker.terminate();
+	worker.join();
+	if (!done.load(std::memory_order_acquire) || errors != 0) {
+		throw std::runtime_error("completion/suspension race lost or corrupted a continuation");
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +1098,10 @@ int main() {
 	const auto short_timeout = std::chrono::seconds(5);
 #endif
 
+	if (!run_with_timeout("inline completion chains", short_timeout, test_inline_completion_chains)) failures++;
+	if (!run_with_timeout("coroutine result lifetime", short_timeout, test_coroutine_completion_lifetime)) failures++;
+	if (!run_with_timeout("coroutine warp context", short_timeout, test_coroutine_warp_context)) failures++;
+	if (!run_with_timeout("completion/suspension race", stress_timeout, test_coroutine_completion_race)) failures++;
 	if (!run_with_timeout("barrier race",          stress_timeout, test_barrier_race))          failures++;
 	if (!run_with_timeout("barrier frame lifetime", stress_timeout, test_barrier_frame_lifetime)) failures++;
 	if (!run_with_timeout("quota lost wakeup",     stress_timeout, test_quota_lost_wakeup))     failures++;
