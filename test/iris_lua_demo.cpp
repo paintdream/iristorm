@@ -25,7 +25,6 @@ using warp_t = void;
 
 using lua_t = iris_lua_t;
 
-// ---- merged sub-tests (see main) ----
 static void test_overload_cast(lua_t lua);
 static void test_registry_types(lua_t lua);
 static void test_functions(lua_t lua);
@@ -516,10 +515,10 @@ static void test_registry_types(lua_t lua) {
 	complex_t cpx;
 	cpx.image = 1.0;
 	cpx.real = 2.0;
-	auto complexType = lua.make_registry_type<complex_t>();
-	auto getType = lua.get_registry_type<complex_t>();
-	lua.deref(std::move(getType));
-	lua.deref(std::move(complexType));
+	auto complex_type = lua.make_registry_type<complex_t>();
+	auto get_type = lua.get_registry_type<complex_t>();
+	lua.deref(std::move(get_type));
+	lua.deref(std::move(complex_type));
 	lua.set_global("test_complex", cpx);
 	auto cpxget = lua.get_global<complex_t>("test_complex");
 	lua.set_global("test_complex_view", lua.make_registry_object_view((number_t*)&cpx));
@@ -528,10 +527,10 @@ static void test_registry_types(lua_t lua) {
 	auto r1 = lua.set_global("test_reflection", functor);
 	auto r2 = lua.set_global<&example_t::accum_value>("test_reflection2");
 
-	auto printTable = lua.load("for i, v in pairs(...) do print(v) end");
-	lua.call<void>(printTable, lua.call<lua_t::ref_t>(r1));
-	lua.call<void>(printTable, lua.call<lua_t::ref_t>(r2));
-	lua.deref(std::move(*printTable));
+	auto print_table = lua.load("for i, v in pairs(...) do print(v) end");
+	lua.call<void>(print_table, lua.call<lua_t::ref_t>(r1));
+	lua.call<void>(print_table, lua.call<lua_t::ref_t>(r2));
+	lua.deref(std::move(*print_table));
 
 	auto shared_object_example_type = lua.make_registry_type<shared_object_example_t>();
 	auto shared_ptr_instance = lua_t::shared_ref_t<shared_object_example_t>::make(1);
@@ -661,7 +660,7 @@ static void test_cross_vm(lua_t lua) {
 	target.native_pop_variable(1);
 	target.call<void>(std::move(ft));
 
-	auto callResult = target.call<void>(target.load("\n\
+	auto call_result = target.call<void>(target.load("\n\
 function test(a, b, c) \n\
 	print('cross value ' .. b.value) \n\
 	b:base_func() \n\
@@ -686,8 +685,8 @@ function test2() \n\
 	return a \n\
 end\n\
 ").value());
-	if (!callResult) {
-		fprintf(stderr, "Lua code error: %s\n", callResult.message.c_str());
+	if (!call_result) {
+		fprintf(stderr, "Lua code error: %s\n", call_result.message.c_str());
 		IRIS_ASSERT(false);
 	}
 
@@ -699,9 +698,9 @@ end\n\
 		temp_type.make_cast(target, target.make_type<example_base_t>());
 	}
 
-	auto callResultProperty = target.call<void>(test, "existing", target.make_registry_object_view<example_t>(&existing_object), target.make_object_view<example_t>(temp_type, &existing_object));
-	if (!callResultProperty) {
-		fprintf(stderr, "Lua code error: %s\n", callResultProperty.message.c_str());
+	auto call_result_property = target.call<void>(test, "existing", target.make_registry_object_view<example_t>(&existing_object), target.make_object_view<example_t>(temp_type, &existing_object));
+	if (!call_result_property) {
+		fprintf(stderr, "Lua code error: %s\n", call_result_property.message.c_str());
 		IRIS_ASSERT(false);
 	}
 
@@ -730,19 +729,18 @@ end\n\
 	target.native_cross_transfer_variable<true>(lua, -1);
 	target.native_pop_variable(1);
 
-	// a cycle through function upvalues has no registry entry to stop it, crossing it
-	// must terminate at the depth guard (nil on the target plus a systrap report)
-	// instead of exhausting the native stack
+	// a cycle through function upvalues must terminate at the depth guard
+	// (nil on the target plus a systrap report) instead of exhausting the native stack
 	{
-		auto callResultCycle = lua.call<void>(lua.load("\n\
+		auto call_result_cycle = lua.call<void>(lua.load("\n\
 	function make_cycle() \n\
 		local a, b \n\
 		a = function() return b end \n\
 		b = function() return a end \n\
 		return { a = a, b = b } \n\
 	end\n").value());
-		if (!callResultCycle) {
-			fprintf(stderr, "Lua code error: %s\n", callResultCycle.message.c_str());
+		if (!call_result_cycle) {
+			fprintf(stderr, "Lua code error: %s\n", call_result_cycle.message.c_str());
 			IRIS_ASSERT(false);
 		}
 
@@ -758,8 +756,8 @@ end\n\
 		lua_rawset(L, LUA_REGISTRYINDEX);
 
 		auto make_cycle = lua.get_global<lua_t::ref_t>("make_cycle");
-		auto resultCycle = lua.native_call(std::move(make_cycle), 0);
-		IRIS_ASSERT(resultCycle);
+		auto result_cycle = lua.native_call(std::move(make_cycle), 0);
+		IRIS_ASSERT(result_cycle);
 		lua.native_cross_transfer_variable<true>(target, -1);
 		IRIS_ASSERT(lua_type(T, -1) == LUA_TTABLE);
 		IRIS_ASSERT(systrap_hits > 0);
@@ -773,14 +771,14 @@ end\n\
 	}
 	lua_close(T);
 
-	auto callResult2 = lua.call<void>(lua.load("\n\
+	auto call_result2 = lua.call<void>(lua.load("\n\
 	function print2(a) \n\
 		print(a.text) \n\
 		assert(a.b.self == a) \n\
 	end\n").value());
 
-	if (!callResult2) {
-		fprintf(stderr, "Lua code error: %s\n", callResult2.message.c_str());
+	if (!call_result2) {
+		fprintf(stderr, "Lua code error: %s\n", call_result2.message.c_str());
 		IRIS_ASSERT(false);
 	}
 }
@@ -889,7 +887,7 @@ static void test_bindings(lua_t lua) {
 
 	lua.set_global("test_tab", std::move(temp_tab));
 
-	auto callResult3 = lua.call<void>(lua.load("\
+	auto call_result3 = lua.call<void>(lua.load("\
 		print(_VERSION)\n\
 		example_t.native_call() \n\
 		example_t.native_call_noexcept() \n\
@@ -942,8 +940,8 @@ static void test_bindings(lua_t lua) {
 		for i = 1, #t do\n\
 			print(t[i])\n\
 		end\n").value());
-	if (!callResult3) {
-		fprintf(stderr, "Lua code error: %s\n", callResult3.message.c_str());
+	if (!call_result3) {
+		fprintf(stderr, "Lua code error: %s\n", call_result3.message.c_str());
 		IRIS_ASSERT(false);
 	}
 
@@ -989,7 +987,7 @@ static void test_coroutines(lua_t lua) {
 
 #if LUA_VERSION_NUM <= 501
 	// lua 5.1 do not accept yield from pcall
-	auto callResult4 = lua.call<void>(lua.load("\n\
+	auto call_result4 = lua.call<void>(lua.load("\n\
 		local a = example_t.new(4)\n\
 		local coro = coroutine.create(function() \n\
 			print('coro get ' .. a.coro_get_int('hello')) \n\
@@ -1003,7 +1001,7 @@ static void test_coroutines(lua_t lua) {
 		end)\n\
 		coroutine.resume(coro)\n").value());
 #else
-	auto callResult4 = lua.call<void>(lua.load("\n\
+	auto call_result4 = lua.call<void>(lua.load("\n\
 		local a = example_t.new(5)\n\
 		local coro = coroutine.create(function() \n\
 			local status, message = pcall(function() \n\
@@ -1021,8 +1019,8 @@ static void test_coroutines(lua_t lua) {
 		coroutine.resume(coro)\n").value());
 #endif
 
-	if (!callResult4) {
-		fprintf(stderr, "Lua code error: %s\n", callResult4.message.c_str());
+	if (!call_result4) {
+		fprintf(stderr, "Lua code error: %s\n", call_result4.message.c_str());
 		IRIS_ASSERT(false);
 	}
 
@@ -1063,9 +1061,7 @@ int main(void) {
 	return 0;
 }
 
-// ============================================================================
-// proxy views: in-place member container binding (was iris_lua_proxy_demo.cpp)
-// ============================================================================
+// proxy views: in-place member container binding
 namespace proxy_test {
 
 	struct account_t {
@@ -1080,8 +1076,7 @@ namespace proxy_test {
 		}
 	};
 
-	// custom sequence container: no inheritance from any std container,
-	// just an STL-shaped surface (see docs/design_set_current_proxy.md section 5.1)
+	// custom sequence container with an STL-shaped surface
 	template <typename T>
 	class my_array_t {
 	public:
@@ -1270,8 +1265,7 @@ local ok2 = pcall(function()
 end)
 assert(not ok2)
 
--- custom containers with an STL-shaped surface are indistinguishable
--- from std containers on the lua side (full contract, no probing)
+-- custom containers with an STL-shaped surface behave like std containers here
 local vm = getmetatable(h.values)
 h.values[1] = 10
 h.values[2] = 20
@@ -1406,9 +1400,7 @@ static void test_proxy_views(lua_t lua) {
 	lua.deref(std::move(account_type));
 }
 
-// ============================================================================
-// queue/heap container faces (was iris_lua_queue_demo.cpp)
-// ============================================================================
+// queue/heap container faces
 namespace queue_test {
 
 	// host with the three queue-family members:
@@ -1531,9 +1523,7 @@ assert(not ok5)
 -- data keys never shadow: queue face has no data key space at all
 assert(a.streaming.foo == nil)
 
--- move-only: whole-container assignment is not registered, so writing a table
--- must not reach C++ (silent no-op on the owner's default __newindex) -- assert
--- the C++ side is untouched rather than expecting an error
+-- move-only: __set is not registered, a table write no-ops on the default __newindex
 a.streaming = { 7, 8, 9 }
 assert(sm.empty(a.streaming) == true and #a.streaming == 0)
 
@@ -1541,8 +1531,7 @@ assert(sm.empty(a.streaming) == true and #a.streaming == 0)
 local ok6 = pcall(function() a.streaming[1] = 5 end)
 assert(not ok6)
 
--- multi-node: block_size/ sizeof(int) = 256 elements per node, cross a node
--- boundary to exercise the block-chaining path through the binding
+-- multi-node: block_size / sizeof(int) = 256 elements per node, cross a node boundary
 local big = 256 * 2 + 17
 for i = 1, big do
 	sm.push(a.streaming, i)
@@ -1662,10 +1651,8 @@ static void test_queue_faces(lua_t lua) {
 		IRIS_ASSERT(host.streaming.front() == 99 && host.streaming.size() == 1);
 	}
 
-	// two independent lua states holding proxy views into the SAME C++ container:
-	// the documented cross-warp usage shape (one side pushes, the other pops).
-	// Container-level SPSC safety is covered by test/iris_dispatcher_demo.cpp;
-	// this asserts the binding allows both ends to address one host container.
+	// two lua states holding proxy views into the same C++ container:
+	// the documented cross-warp shape (one side pushes, the other pops)
 	{
 		stream_host_t shared;
 
@@ -1705,9 +1692,7 @@ static void test_queue_faces(lua_t lua) {
 	lua.deref(std::move(host_type));
 }
 
-// ============================================================================
-// shared elements (was iris_lua_shared_element_demo.cpp)
-// ============================================================================
+// shared elements
 namespace shared_element_test {
 
 	struct node_t : lua_t::shared_local_object_t<node_t> {
@@ -1732,8 +1717,7 @@ namespace shared_element_test {
 }
 
 // verify vector<shared_ref_t<T>> elements nest correctly through a proxy:
-// element reads yield shared-object views (refcount-anchored), writes go
-// through to the heap objects, GC releases cleanly
+// reads yield shared-object views, writes go through to the heap objects
 static void test_shared_elements(lua_t lua) {
 	using namespace shared_element_test;
 

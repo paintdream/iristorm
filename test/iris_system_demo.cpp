@@ -297,14 +297,14 @@ int main(void) {
 		// tombstone) - a second entry would let binary_find hit the stale
 		// tombstone on the next lookup.
 		{
-			size_t keptKeys = 0, reusedKeys = 0, keptAlive = 0, reusedAlive = 0;
+			size_t kept_keys = 0, reused_keys = 0, kept_alive = 0, reused_alive = 0;
 			for (auto& kv : reuse_system.get_entity_components()) {
 				const bool alive = kv.second != static_cast<size_t>(~(entity_t)0);
-				if (kv.first == kept) { keptKeys++; if (alive) keptAlive++; }
-				if (kv.first == reused) { reusedKeys++; if (alive) reusedAlive++; }
+				if (kv.first == kept) { kept_keys++; if (alive) kept_alive++; }
+				if (kv.first == reused) { reused_keys++; if (alive) reused_alive++; }
 			}
-			IRIS_ASSERT(keptKeys == 1 && reusedKeys == 1);
-			IRIS_ASSERT(keptAlive == 1 && reusedAlive == 1);
+			IRIS_ASSERT(kept_keys == 1 && reused_keys == 1);
+			IRIS_ASSERT(kept_alive == 1 && reused_alive == 1);
 		}
 
 		// Delete once more and re-verify the tombstone is not alive.
@@ -374,14 +374,14 @@ int main(void) {
 		}
 		// invariant audit: single live slot per entity, each inside the pool
 		{
-			const size_t cBegin = wide.component<WideComp>().begin_index();
-			const size_t cEnd = wide.component<WideComp>().end_index();
-			std::map<size_t, size_t> slotUse;
+			const size_t comp_begin = wide.component<WideComp>().begin_index();
+			const size_t comp_end = wide.component<WideComp>().end_index();
+			std::map<size_t, size_t> slot_use;
 			for (auto& kv : wide.get_entity_components()) {
 				if (kv.second == static_cast<size_t>(~(entity_t)0)) continue;
 				const size_t s = static_cast<size_t>(kv.second);
-				IRIS_ASSERT(s >= cBegin && s < cEnd);   // live slot in range
-				IRIS_ASSERT(slotUse[s]++ == 0);         // no duplicate slots
+				IRIS_ASSERT(s >= comp_begin && s < comp_end); // live slot in range
+				IRIS_ASSERT(slot_use[s]++ == 0); // no duplicate slots
 			}
 		}
 		for (entity_t e : alive) {

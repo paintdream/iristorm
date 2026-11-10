@@ -322,8 +322,8 @@ namespace iris {
 
 			// zip encoding
 			for (size_t i = 0; i < n; i++) {
-				tree_code_t& treeCode = all_nodes[i];
-				treeCode.code = meta::encode(box, treeCode.tree->key);
+				tree_code_t& tree_code = all_nodes[i];
+				tree_code.code = meta::encode(box, tree_code.tree->key);
 			}
 
 			std::sort(all_nodes.begin(), all_nodes.end());

@@ -25,7 +25,6 @@ using quota_t = iris_quota_t<int, 2>;
 using quota_queue_t = iris_quota_queue_t<quota_t, warp_t>;
 static std::atomic<size_t> pending_count = 0;
 
-// ---- merged sub-tests ----
 static int run_demo_checks(void);
 template <typename fn_t>
 static bool run_with_timeout(const char* name, std::chrono::milliseconds ms, fn_t&& fn);
@@ -175,28 +174,28 @@ static void example_dispatch_coroutine(worker_t& worker) {
 	dispatcher_t dispatcher(worker);
 	std::atomic<bool> finished2 = false;
 
-	auto preNode = dispatcher.allocate(warp_t::get_current(), [](const auto& handle) {
+	auto pre_node = dispatcher.allocate(warp_t::get_current(), [](const auto& handle) {
 		printf("example_from_coroutine 0000!\n");
 	});
 
-	auto postNode = dispatcher.allocate(warp_t::get_current(), [&finished2, &finished](const auto& handle) {
+	auto post_node = dispatcher.allocate(warp_t::get_current(), [&finished2, &finished](const auto& handle) {
 		IRIS_ASSERT(finished.load(std::memory_order_acquire));
 		printf("example_from_coroutine 2222!\n");
 
 		finished2.store(true, std::memory_order_release);
 	});
 
-	auto coroNode = iris_dispatch_coroutine(dispatcher, [](dispatcher_t& dispatcher, std::atomic<bool>& finished) -> coroutine_t {
+	auto coro_node = iris_dispatch_coroutine(dispatcher, [](dispatcher_t& dispatcher, std::atomic<bool>& finished) -> coroutine_t {
 		printf("example_from_coroutine 1111!\n");
 		co_await iris_awaitable(warp_t::get_current(), []() {});
 		finished.store(true, std::memory_order_release);
 		co_return;
 	}(dispatcher, finished));
-	dispatcher.order(preNode, coroNode);
-	dispatcher.order(coroNode, postNode);
-	dispatcher.dispatch(std::move(coroNode));
-	dispatcher.dispatch(std::move(postNode));
-	dispatcher.dispatch(std::move(preNode));
+	dispatcher.order(pre_node, coro_node);
+	dispatcher.order(coro_node, post_node);
+	dispatcher.dispatch(std::move(coro_node));
+	dispatcher.dispatch(std::move(post_node));
+	dispatcher.dispatch(std::move(pre_node));
 
 	while (!finished2.load(std::memory_order_acquire) || dispatcher.get_pending_count() != 0) {
 		worker.poll_one(0, std::chrono::milliseconds(50));
@@ -242,9 +241,7 @@ static coroutine_t example_quota(quota_queue_t& q) {
 	}
 }
 
-// ============================================================================
-// functional demo (originally the whole file's main)
-// ============================================================================
+// functional demo, originally the whole file's main
 static int run_demo_checks(void) {
 	static constexpr size_t thread_count = 8;
 	static constexpr size_t warp_count = 16;
@@ -331,14 +328,9 @@ static int run_demo_checks(void) {
 	return 0;
 }
 
+// stress tests, was iris_coroutine_stress.cpp
 
-// ============================================================================
-// stress tests (was iris_coroutine_stress.cpp)
-// ============================================================================
-
-// ---------------------------------------------------------------------------
-// Watchdog helper: run `fn` in a detached worker; wait up to `ms`.
-// returns true when finished within budget.
+// watchdog helper: run fn in a detached worker, fail if it exceeds the deadline
 template <typename fn_t>
 static bool run_with_timeout(const char* name, std::chrono::milliseconds ms, fn_t&& fn) {
 	std::promise<void> done;
@@ -432,7 +424,7 @@ static void test_inline_completion_chains() {
 			size_t short_span = measure(32);
 			size_t long_span = measure(256);
 			printf("  %s stack span: 32=%zu, 256=%zu\n", task ? "awaitable" : "coroutine", short_span, long_span);
-			// Check the bound before the large case can overflow an unfixed build.
+			// check the bound before the large case can overflow an unfixed build
 			if (long_span > short_span + 16 * 1024 || long_span > 64 * 1024) {
 				throw std::runtime_error("synchronous completion stack grows with chain length");
 			}
@@ -518,7 +510,7 @@ static coroutine_t nested_warp_chain(warp_t& a, warp_t& b, coroutine_stack_sampl
 	for (size_t i = 0; i < 32; i++) {
 		co_await inline_child(sample);
 		if (i == 5) {
-			// Anchors the downstream depth-6 TLS trampoline's cross-warp regression.
+			// anchors the downstream depth-6 TLS trampoline's cross-warp regression
 			b.queue_routine([&]() {
 				nested_warp_child(b, sample, errors).then([&b_done]() { b_done = true; }).run();
 			});
@@ -637,7 +629,7 @@ static void test_coroutine_warp_context() {
 struct coroutine_thread_resume_t {
 	bool await_ready() const noexcept { return false; }
 	void await_suspend(std::coroutine_handle<> handle) const {
-		// Force completion on another thread before the parent's run() returns.
+		// force completion on another thread before the parent's run() returns
 		std::thread([handle]() { handle.resume(); }).join();
 	}
 	void await_resume() const noexcept {}
@@ -700,21 +692,10 @@ static void test_coroutine_completion_race() {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: iris_barrier_t - race between concurrent await_suspend writers and
-// the thread that runs complete().  When `await_count.fetch_add(1)` returns
-// the index, the writing thread has NOT yet stored `handles[index].handle`.
-// If another thread is "last" and runs complete() before our store is
-// visible, complete() sees an empty handle and skips dispatching it.
-//
-// We make this fragile situation likely by:
-//   - large N (N coroutines per round)
-//   - many rounds
-//   - spawning each coroutine on a separate thread
-// Helper: GCC 12 lambda coroutines erroneously copy awaitables into the
-// coroutine frame.  Using a regular function with reference parameters
-// works around this (GCC correctly stores only references for function
-// parameters).  Same pattern as iris_coroutine_demo.cpp.
+// Test 1: iris_barrier_t - race between concurrent await_suspend writers and complete():
+// the last writer may not have stored its handle slot yet when complete() iterates it.
+// launch from many threads and rounds to make the interleaving likely.
+// helper as a regular function: GCC 12 lambda coroutines copy awaitables into the frame.
 template <typename barrier_t>
 static coroutine_t barrier_worker(barrier_t& barrier,
                                    std::atomic<size_t>& launched,
@@ -727,22 +708,22 @@ static coroutine_t barrier_worker(barrier_t& barrier,
 static void test_barrier_race() {
 	using barrier_t = iris_barrier_t<void, bool, worker_t>;
 
-	const size_t N = 16;            // participants per round
-	const size_t rounds = 40;       // number of barrier rounds
+	const size_t participants = 16;
+	const size_t rounds = 40;
 
 	worker_t worker(std::thread::hardware_concurrency());
 	worker.start();
 
 	for (size_t r = 0; r < rounds; r++) {
-		barrier_t barrier(worker, N);
+		barrier_t barrier(worker, participants);
 		std::atomic<size_t> resumed{ 0 };
 		std::atomic<size_t> launched{ 0 };
 
-		// Launch from many threads to maximize fetch_add interleaving.
+		// launch from many threads to maximize fetch_add interleaving
 		std::vector<std::thread> ts;
-		ts.reserve(N);
+		ts.reserve(participants);
 		std::atomic<bool> go{ false };
-		for (size_t i = 0; i < N; i++) {
+		for (size_t i = 0; i < participants; i++) {
 			ts.emplace_back([&]() {
 				while (!go.load(std::memory_order_acquire)) { std::this_thread::yield(); }
 				barrier_worker(barrier, launched, resumed).run();
@@ -751,17 +732,17 @@ static void test_barrier_race() {
 		go.store(true, std::memory_order_release);
 		for (auto& t : ts) t.join();
 
-		// Wait until all are launched (`run()` returns after initial suspend).
-		while (launched.load(std::memory_order_acquire) != N) {
+		// wait until all are launched, run() returns after initial suspend
+		while (launched.load(std::memory_order_acquire) != participants) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 
-		// All N should eventually be resumed.
+		// all participants should eventually be resumed
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-		while (resumed.load(std::memory_order_acquire) != N) {
+		while (resumed.load(std::memory_order_acquire) != participants) {
 			if (std::chrono::steady_clock::now() > deadline) {
 				printf("  round %zu: only %zu/%zu coroutines resumed\n",
-					r, resumed.load(std::memory_order_acquire), N);
+					r, resumed.load(std::memory_order_acquire), participants);
 				worker.terminate();
 				worker.join();
 				throw std::runtime_error("barrier stuck");
@@ -774,16 +755,8 @@ static void test_barrier_race() {
 	worker.join();
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: iris_quota_queue_t - lost wakeup race.
-//
-// guard(amount) decides `ready` at construction time. If quota.acquire fails,
-// await_suspend pushes into `handles`.  Meanwhile another thread can call
-// release(); release() iterates `handles` - but if our push hasn't landed yet,
-// it sees nothing.  We then push, and the wakeup never comes.
-//
-// We reproduce by hammering a small quota with many consumers, each releasing
-// quickly.  If any consumer never resumes, we hang.
+// Test 2: iris_quota_queue_t - lost wakeup race: release() can iterate handles
+// before a blocked guard() push lands, so the wakeup never comes.
 static void test_quota_lost_wakeup() {
 	using quota_t = iris_quota_t<int, 1>;
 	using quota_queue_t = iris_quota_queue_t<quota_t, void, worker_t>;
@@ -791,10 +764,10 @@ static void test_quota_lost_wakeup() {
 	worker_t worker(std::thread::hardware_concurrency());
 	worker.start();
 
-	quota_t quota({ 4 });        // total 4 units
+	quota_t quota({ 4 }); // total 4 units
 	quota_queue_t qq(worker, quota);
 
-	const size_t N = 200;
+	const size_t count = 200;
 	std::atomic<size_t> finished{ 0 };
 
 	auto co = [&]() -> coroutine_t {
@@ -806,13 +779,13 @@ static void test_quota_lost_wakeup() {
 		finished.fetch_add(1, std::memory_order_release);
 	};
 
-	for (size_t i = 0; i < N; i++) co().run();
+	for (size_t i = 0; i < count; i++) co().run();
 
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while (finished.load(std::memory_order_acquire) != N) {
+	while (finished.load(std::memory_order_acquire) != count) {
 		if (std::chrono::steady_clock::now() > deadline) {
 			printf("  finished=%zu/%zu (quota lost wakeup)\n",
-				finished.load(std::memory_order_acquire), N);
+				finished.load(std::memory_order_acquire), count);
 			worker.terminate();
 			worker.join();
 			throw std::runtime_error("quota stuck");
@@ -824,20 +797,14 @@ static void test_quota_lost_wakeup() {
 	worker.join();
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: iris_pipe_t - SPSC race with default iris_no_mutex_t.
-//
-// We have one producer and one consumer, but both run on the async worker
-// pool, so the underlying push/await interleaves freely.  Default no-mutex
-// disables the rendezvous re-check; the producer can increment
-// prepared_count while the consumer increments waiting_count without either
-// observing the other, leading to a stale state and a missed delivery.
-// Helper: avoid GCC 12 lambda-coroutine copy of non-copyable awaitables.
+// Test 3: iris_pipe_t - SPSC race with default iris_no_mutex_t: push and await
+// interleave freely on the worker pool without the rendezvous re-check.
+// helper as a regular function: GCC 12 lambda coroutines copy awaitables into the frame.
 template <typename pipe_t>
 static coroutine_t pipe_consumer(pipe_t& pipe,
                                   std::atomic<int>& consumed,
-                                  int N) {
-	for (int i = 0; i < N; i++) {
+                                  int count) {
+	for (int i = 0; i < count; i++) {
 		int v = co_await pipe;
 		(void)v;
 		consumed.fetch_add(1, std::memory_order_release);
@@ -851,11 +818,11 @@ static void test_pipe_spsc_race() {
 	worker.start();
 
 	pipe_t pipe(worker);
-	const int N = 500;
+	const int count = 500;
 	std::atomic<int> consumed{ 0 };
 
 	auto producer = [&]() -> coroutine_t {
-		for (int i = 0; i < N; i++) {
+		for (int i = 0; i < count; i++) {
 			pipe.emplace(i);
 			// no awaiting - just keep posting
 			co_await iris_awaitable(static_cast<warp_t*>(nullptr),
@@ -863,14 +830,14 @@ static void test_pipe_spsc_race() {
 		}
 	};
 
-	pipe_consumer(pipe, consumed, N).run();
+	pipe_consumer(pipe, consumed, count).run();
 	producer().run();
 
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while (consumed.load(std::memory_order_acquire) != N) {
+	while (consumed.load(std::memory_order_acquire) != count) {
 		if (std::chrono::steady_clock::now() > deadline) {
 			printf("  consumed=%d/%d (pipe lost wakeup)\n",
-				consumed.load(std::memory_order_acquire), N);
+				consumed.load(std::memory_order_acquire), count);
 			worker.terminate();
 			worker.join();
 			throw std::runtime_error("pipe stuck");
@@ -882,11 +849,8 @@ static void test_pipe_spsc_race() {
 	worker.join();
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: iris_dispatcher_t::next() - REMOVED upstream.  Kept here as a
-// compile-time guard: if someone re-introduces a misnamed `next()` overload,
-// this test will fail to compile and remind them to handle the routine
-// lifecycle correctly.
+// Test 4: iris_dispatcher_t::next() - removed upstream, kept as a compile-time
+// guard against a misnamed next() overload
 static void test_dispatcher_next_handle() {
 	worker_t worker(2);
 	worker.start();
@@ -912,43 +876,41 @@ static void test_dispatcher_next_handle() {
 	worker.join();
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: iris_warp_t - concurrent suspend / resume / queue_routine_post.
-// Stress the warp scheduler to expose any starvation under heavy contention.
+// Test 5: iris_warp_t - concurrent suspend / resume / queue_routine_post
 static void test_warp_suspend_resume_storm() {
 	worker_t worker(std::thread::hardware_concurrency());
 	worker.start();
 
-	const size_t W = 4;
+	const size_t warp_count = 4;
 	std::vector<warp_t> warps;
-	warps.reserve(W);
-	for (size_t i = 0; i < W; i++) warps.emplace_back(worker);
+	warps.reserve(warp_count);
+	for (size_t i = 0; i < warp_count; i++) warps.emplace_back(worker);
 
-	const size_t TASKS = 2000;
+	const size_t task_count = 2000;
 	std::atomic<size_t> done{ 0 };
 
 	std::atomic<bool> stop{ false };
 	std::thread agitator([&]() {
 		std::mt19937 rng(123);
 		while (!stop.load(std::memory_order_acquire)) {
-			warp_t& w = warps[rng() % W];
+			warp_t& w = warps[rng() % warp_count];
 			w.suspend();
 			std::this_thread::sleep_for(std::chrono::microseconds(rng() % 100));
 			w.resume();
 		}
 	});
 
-	for (size_t i = 0; i < TASKS; i++) {
-		warps[i % W].queue_routine_post([&done]() {
+	for (size_t i = 0; i < task_count; i++) {
+		warps[i % warp_count].queue_routine_post([&done]() {
 			done.fetch_add(1, std::memory_order_release);
 		});
 	}
 
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-	while (done.load(std::memory_order_acquire) != TASKS) {
+	while (done.load(std::memory_order_acquire) != task_count) {
 		if (std::chrono::steady_clock::now() > deadline) {
 			printf("  done=%zu/%zu (warp starvation)\n",
-				done.load(std::memory_order_acquire), TASKS);
+				done.load(std::memory_order_acquire), task_count);
 			stop.store(true, std::memory_order_release);
 			agitator.join();
 			worker.terminate();
@@ -966,9 +928,8 @@ static void test_warp_suspend_resume_storm() {
 	while (warp_t::poll(warps.begin(), warps.end())) {}
 }
 
-// ---------------------------------------------------------------------------
 // Test 6: iris_event_t - repeated notify/reset cycles with many waiters.
-// Helper: avoid GCC 12 lambda-coroutine copy of non-copyable awaitables.
+// helper as a regular function: GCC 12 lambda coroutines copy awaitables into the frame.
 template <typename event_t>
 static coroutine_t event_waiter(event_t& ev,
                                  std::atomic<size_t>& resumed) {
@@ -991,7 +952,7 @@ static void test_event_cycle() {
 		ev.reset();
 		size_t base = resumed.load(std::memory_order_acquire);
 		for (size_t i = 0; i < waiters_per_round; i++) event_waiter(ev, resumed).run();
-		// Give them a moment to suspend.
+		// give them a moment to suspend
 		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		ev.notify();
 
@@ -1012,20 +973,9 @@ static void test_event_cycle() {
 	worker.join();
 }
 
-// ---------------------------------------------------------------------------
-// Test 1b: iris_barrier_t frame lifetime - the barrier is owned by a coroutine
-// frame and that frame is destroyed by the FIRST dispatch of complete().
-//
-// complete() dispatches handles in slot order. Slot 0 is the owner here, so the
-// first resume runs the owner to co_return; final_suspend is suspend_never, so
-// the frame - and the barrier, and the handles[] vector living inside it - is
-// freed *while complete() is still looping over handles[1..N-1]*. The owner then
-// reuses the freed block with a same-sized allocation, so a loop that still
-// reads handles[] sees clobbered bytes (this reproduced "vector subscript out of
-// range" / an access violation before the snapshot fix).
-//
-// Slot order == launch order: run() executes the body up to the first co_await
-// synchronously, so the owner launched first owns slot 0.
+// Test 1b: iris_barrier_t frame lifetime - the barrier is owned by a coroutine frame
+// freed by the first dispatch of complete() while it still loops over the remaining
+// handles, so the loop must read a snapshot, not the freed vector
 struct frame_garbage_t {
 	size_t payload[16];
 };
@@ -1035,19 +985,19 @@ static coroutine_t barrier_frame_owner(std::shared_ptr<void> keepalive,
                                         std::atomic<size_t>& done) {
 	co_await *barrier;
 	(void)keepalive;
-	// Reuse the just-freed frame block (this coroutine's own locals) so stale
-	// handles[] reads observe garbage rather than intact data.
+	// reuse the just-freed frame block (this coroutine's own locals) so stale
+	// handles[] reads observe garbage rather than intact data
 	frame_garbage_t garbage;
 	for (size_t i = 0; i < 16; i++) garbage.payload[i] = 0xDEADBEEF00000000ull + i;
 	done.fetch_add(1, std::memory_order_release);
-	// Returning here destroys the coroutine frame, which owns the barrier whose
-	// complete() is still unwinding its dispatch loop.
+	// returning here destroys the coroutine frame, which owns the barrier whose
+	// complete() is still unwinding its dispatch loop
 }
 
 static void test_barrier_frame_lifetime() {
 	using barrier_t = iris_barrier_t<void, bool, worker_t>;
 
-	const size_t N = 8;             // participants per round
+	const size_t participants = 8;
 	const size_t rounds = 500;
 
 	worker_t worker(std::max<size_t>(2, std::thread::hardware_concurrency()));
@@ -1057,21 +1007,21 @@ static void test_barrier_frame_lifetime() {
 		std::atomic<size_t> done{ 0 };
 		{
 			auto holder = std::shared_ptr<barrier_t>(
-				new barrier_t(worker, N),
+				new barrier_t(worker, participants),
 				[](barrier_t* p) { delete p; });
 
 			// owner FIRST -> slot 0 -> dispatched first by complete()
 			barrier_frame_owner(holder, holder.get(), done).run();
-			for (size_t i = 1; i < N; i++) {
+			for (size_t i = 1; i < participants; i++) {
 				barrier_frame_owner(std::shared_ptr<void>(), holder.get(), done).run();
 			}
 		}
 
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-		while (done.load(std::memory_order_acquire) != N) {
+		while (done.load(std::memory_order_acquire) != participants) {
 			if (std::chrono::steady_clock::now() > deadline) {
 				printf("  round %zu: only %zu/%zu resumed\n",
-					r, done.load(std::memory_order_acquire), N);
+					r, done.load(std::memory_order_acquire), participants);
 				worker.terminate();
 				worker.join();
 				throw std::runtime_error("barrier frame lifetime stuck");
@@ -1084,9 +1034,6 @@ static void test_barrier_frame_lifetime() {
 	worker.join();
 }
 
-// ============================================================================
-// aggregator
-// ============================================================================
 int main() {
 	int failures = run_demo_checks() == 0 ? 0 : 1;
 
@@ -1102,16 +1049,16 @@ int main() {
 	if (!run_with_timeout("coroutine result lifetime", short_timeout, test_coroutine_completion_lifetime)) failures++;
 	if (!run_with_timeout("coroutine warp context", short_timeout, test_coroutine_warp_context)) failures++;
 	if (!run_with_timeout("completion/suspension race", stress_timeout, test_coroutine_completion_race)) failures++;
-	if (!run_with_timeout("barrier race",          stress_timeout, test_barrier_race))          failures++;
+	if (!run_with_timeout("barrier race", stress_timeout, test_barrier_race)) failures++;
 	if (!run_with_timeout("barrier frame lifetime", stress_timeout, test_barrier_frame_lifetime)) failures++;
-	if (!run_with_timeout("quota lost wakeup",     stress_timeout, test_quota_lost_wakeup))     failures++;
-	if (!run_with_timeout("pipe SPSC race",        stress_timeout, test_pipe_spsc_race))        failures++;
-	if (!run_with_timeout("dispatcher::next",      short_timeout,  test_dispatcher_next_handle)) failures++;
-	if (!run_with_timeout("warp suspend storm",    stress_timeout, test_warp_suspend_resume_storm)) failures++;
-	if (!run_with_timeout("event reset/notify",    stress_timeout, test_event_cycle))           failures++;
+	if (!run_with_timeout("quota lost wakeup", stress_timeout, test_quota_lost_wakeup)) failures++;
+	if (!run_with_timeout("pipe SPSC race", stress_timeout, test_pipe_spsc_race)) failures++;
+	if (!run_with_timeout("dispatcher::next", short_timeout, test_dispatcher_next_handle)) failures++;
+	if (!run_with_timeout("warp suspend storm", stress_timeout, test_warp_suspend_resume_storm)) failures++;
+	if (!run_with_timeout("event reset/notify", stress_timeout, test_event_cycle)) failures++;
 
 	printf("\n==== %d failure(s) ====\n", failures);
-	// We intentionally do NOT call std::exit so detached watchdog threads
-	// don't terminate the process mid-run. Return the failure count.
+	// std::exit is intentionally not called so detached watchdog threads
+	// don't terminate the process mid-run, return the failure count
 	return failures;
 }

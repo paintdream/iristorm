@@ -618,8 +618,8 @@ namespace iris {
 		IRIS_ASSERT(value != 0);
 #if defined(_MSC_VER)
 #if !defined(_M_AMD64)
-		uint32_t lowPart = (uint32_t)(value & 0xffffffff);
-		return lowPart == 0 ? iris_get_trailing_zeros((uint32_t)((value >> 31) >> 1)) + 32 : iris_get_trailing_zeros(lowPart);
+		uint32_t low_part = (uint32_t)(value & 0xffffffff);
+		return low_part == 0 ? iris_get_trailing_zeros((uint32_t)((value >> 31) >> 1)) + 32 : iris_get_trailing_zeros(low_part);
 #else
 		unsigned long index;
 		_BitScanForward64(&index, value);
@@ -2142,7 +2142,7 @@ namespace iris {
 	template <typename value_t, template <typename...> class allocator_t = iris_default_block_allocator_t, bool enable_memory_fence = true, typename listener_t = void, template <typename...> class debug_allocator_t = allocator_t, bool enable_spsc_optimize = enable_memory_fence>
 	struct iris_queue_list_t : protected allocator_t<impl::node_t<value_t, allocator_t, enable_memory_fence, allocator_t, enable_spsc_optimize>>, protected enable_in_out_fence_t<> {
 		using element_t = value_t;
-		using value_type = value_t; // ducktype surface alias for container contracts (e.g. proxy_view_t queue face)
+		using value_type = value_t; // ducktype surface alias for container contracts
 		using node_t = impl::node_t<element_t, debug_allocator_t, enable_memory_fence, debug_allocator_t, enable_spsc_optimize>;
 		using node_allocator_t = debug_allocator_t<node_t>;
 
@@ -2407,7 +2407,7 @@ namespace iris {
 			return pop_head->top();
 		}
 
-		// queue-contract alias: front() is the next element to pop (same as top())
+		// front() is the next element to pop, same as top()
 		element_t& front() noexcept { return top(); }
 		const element_t& front() const noexcept { return top(); }
 

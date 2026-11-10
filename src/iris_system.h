@@ -138,7 +138,7 @@ namespace iris {
 			// slot (the RenderCamera::Tick Debug assert after an entity-id
 			// reuse). Capture whether the entry exists BEFORE the reserve
 			// below can reallocate the vector and invalidate `iterator`.
-			const bool reuseTombstone = iterator != entity_components.end();
+			const bool reuse_tombstone = iterator != entity_components.end();
 
 			if (entity_components.capacity() <= entity_components.size() + 1) {
 				entity_components.reserve(entity_components.size() * 3 / 2);
@@ -148,15 +148,15 @@ namespace iris {
 
 			// The new component lives at the just-pushed slot
 			// (entities.end_index() before entities.push()).
-			const index_t newIndex = iris_verify_cast<index_t>(entities.end_index());
-			if (reuseTombstone) {
+			const index_t new_index = iris_verify_cast<index_t>(entities.end_index());
+			if (reuse_tombstone) {
 				// Re-locate the entry after the reserve (the old iterator may
 				// be dangling) and point it at the new slot.
 				auto it = iris_binary_find(entity_components.begin(), entity_components.end(), entity);
 				IRIS_ASSERT(it != entity_components.end());
-				it->second = newIndex;
+				it->second = new_index;
 			} else {
-				iris_binary_insert(entity_components, iris_make_key_value(entity, newIndex));
+				iris_binary_insert(entity_components, iris_make_key_value(entity, new_index));
 			}
 
 			entities.push(entity);

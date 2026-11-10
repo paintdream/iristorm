@@ -222,23 +222,23 @@ namespace iris {
 			// resumes the parent from inside THIS coroutine's completion (a
 			// nested resume), so it must switch to the parent's fiber lane for
 			// the duration of that resume and switch back afterwards.
-			const char* parentFiber = IRIS_PROFILE_COROUTINE_CURRENT();
+			const char* parent_fiber = IRIS_PROFILE_COROUTINE_CURRENT();
 			if constexpr (!std::is_void_v<return_t>) {
-				complete([this, parent_handle = std::move(parent_handle), parentFiber](void*, return_t&& value) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
+				complete([this, parent_handle = std::move(parent_handle), parent_fiber](void*, return_t&& value) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
 					await_result.emplace(std::move(value));
 					if (await_handshake.exchange(true, std::memory_order_acq_rel)) {
 						// Resuming may destroy this awaiter; do not access it afterwards.
 						std::coroutine_handle<> handle = parent_handle;
-						const char* fiber = parentFiber;
+						const char* fiber = parent_fiber;
 						IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
 						handle.resume();
 					}
 				});
 			} else {
-				complete([this, parent_handle = std::move(parent_handle), parentFiber](void*) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
+				complete([this, parent_handle = std::move(parent_handle), parent_fiber](void*) mutable noexcept(noexcept(std::declval<std::coroutine_handle<>>().resume())) {
 					if (await_handshake.exchange(true, std::memory_order_acq_rel)) {
 						std::coroutine_handle<> handle = parent_handle;
-						const char* fiber = parentFiber;
+						const char* fiber = parent_fiber;
 						IRIS_PROFILE_COROUTINE_RESUME(handle, fiber);
 						handle.resume();
 					}

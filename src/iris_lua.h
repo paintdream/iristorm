@@ -51,9 +51,6 @@ extern "C" {
 #error "Unsupported lua version!"
 #endif
 
-// LUA_OK redefinition is benign on LuaJIT (identical replacement list);
-// lua_rawlen / lua_absindex / LUA_NUMTYPES do not exist in LuaJIT either,
-// so these shims must stay enabled for it
 #if LUA_VERSION_NUM <= 501
 #define LUA_OK 0
 #define lua_rawlen lua_objlen
@@ -61,8 +58,7 @@ extern "C" {
 #define LUA_NUMTYPES (LUA_TTHREAD + 1)
 #endif
 
-// vanilla lua 5.1 lacks luaL_loadbufferx (a 5.2+ api); LuaJIT provides it
-// natively even at LUA_VERSION_NUM 501, so the shim only applies to non-LuaJIT
+// vanilla lua 5.1 lacks luaL_loadbufferx, LuaJIT provides it natively
 #if LUA_VERSION_NUM <= 501 && !defined(LUAJIT_VERSION)
 #define luaL_loadbufferx(L, b, s, n, m) luaL_loadbuffer(L, b, s, n)
 #endif
@@ -111,11 +107,9 @@ namespace iris {
 
 	// A simple lua binding with C++17
 	template <typename container_type>
-	struct proxy_view_t; // forward declaration: members of iris_lua_t reference it
+	struct proxy_view_t;
 
-	// ---- container face detection (structured ducktyping, mirrors iris_is_map) ----
-	// queue face: FIFO/LIFO structures without random access (std::queue, iris_queue_list_t):
-	// value_type + size() + empty() + front() + push(v) + pop()
+	// queue face: FIFO/LIFO containers without random access (std::queue, iris_queue_list_t)
 	template <typename type_t, typename = void>
 	struct iris_is_queue : std::false_type {};
 
@@ -129,7 +123,7 @@ namespace iris {
 		decltype(std::declval<type_t>().pop())
 	>> : std::true_type {};
 
-	// heap face: priority queues (std::priority_queue): value_type + size() + empty() + top() + push(v) + pop()
+	// heap face: priority queues (std::priority_queue)
 	template <typename type_t, typename = void>
 	struct iris_is_heap : std::false_type {};
 
@@ -152,7 +146,7 @@ namespace iris {
 
 	struct iris_lua_t : enable_read_write_fence_t<> {
 		template <typename container_type>
-		friend struct proxy_view_t; // proxy internals need push/get/check access
+		friend struct proxy_view_t;
 		static constexpr size_t size_mask_view = 1u;
 		static constexpr size_t size_mask_alignment = 2u;
 		static constexpr size_t state_mask_reflection = 1u;
@@ -1571,12 +1565,8 @@ namespace iris {
 		}
 
 		// set 'current' lua table, binding a member container as an in-place proxy view:
-		// lua code gets a.vector[i] = 5 forwarded to the container embedded in the owner,
-		// instead of reading the whole container out and writing it back.
-		// only accepts member object pointers; const members get a read-only proxy (no __set).
-		// proxy methods are only reachable through the metatable (getmetatable(p).push_back(p, v)),
-		// so data keys are never shadowed. whole-container assignment (a.vector = proxy_or_table)
-		// is supported through __set.
+		// lua reads/writes go to the container embedded in the owner, no read-modify-write.
+		// const members get a read-only proxy, proxy methods are metatable-only
 		template <auto ptr, typename type_t = void, typename key_t, typename... envs_t>
 		reflection_t set_current_proxy(key_t&& key, envs_t&&... envs) {
 			static_assert(std::is_member_object_pointer_v<decltype(ptr)>, "set_current_proxy only accepts member object pointers.");
@@ -1600,8 +1590,7 @@ namespace iris {
 			if constexpr (std::is_const_v<typename member_object_traits_t<decltype(ptr)>::value>) {
 				// const members are read-only proxies, no __set entry
 			} else if constexpr (!std::is_copy_assignable_v<std::remove_const_t<typename member_object_traits_t<decltype(ptr)>::value>>) {
-				// move-only containers (e.g. iris_queue_list_t) cannot take the whole-container
-				// copy assignment in property_proxy_set_proxy, no __set entry either
+				// move-only containers cannot take whole-container copy assignment, no __set entry either
 			} else {
 				lua_pushliteral(L, "__set");
 				lua_rawget(L, -2);
@@ -1617,10 +1606,7 @@ namespace iris {
 		}
 
 		// set 'current' lua table, binding a computed property to custom getter/setter
-		// functions: lua reads a.x -> getter(object), writes a.x = v -> setter(object, v).
-		// getter and setter are member function pointers, or free function pointers whose
-		// first parameter is the owner. pass only a getter (or nullptr as the setter) for
-		// a read-only property.
+		// functions: lua reads a.x -> getter(object), writes a.x = v -> setter(object, v)
 		template <auto getter, auto setter = nullptr, typename type_t = void, typename key_t, typename... envs_t>
 		reflection_t set_current_prop(key_t&& key, envs_t&&... envs) {
 			static_assert(std::is_member_function_pointer_v<decltype(getter)> || (std::is_pointer_v<decltype(getter)> && std::is_function_v<std::remove_pointer_t<decltype(getter)>>), "A property getter must be a member or free function pointer.");
@@ -1655,8 +1641,7 @@ namespace iris {
 				lua_rawset(L, -3);
 				lua_pop(L, 1);
 			} else {
-				// read-only: register an erroring __set so assignments fail loudly
-				// instead of silently no-opping (matches const member properties)
+				// read-only: assignments must fail loudly instead of silently no-opping
 				lua_pushliteral(L, "__set");
 				lua_rawget(L, -2);
 				IRIS_ASSERT(lua_type(L, -1) == LUA_TTABLE);
@@ -1670,10 +1655,7 @@ namespace iris {
 			return nullptr;
 		}
 
-		// functor form of set_current_prop, mirroring set_current(key, functor):
-		// stateful getters/setters are stored in gc-managed userdata referenced
-		// as closure upvalues. the functor's first parameter is the owner (T* or T&),
-		// setters take exactly one additional value parameter.
+		// functor form of set_current_prop, mirroring set_current(key, functor)
 		template <typename key_t, typename getter_t>
 		reflection_t set_current_prop(key_t&& key, getter_t&& getter) {
 			return set_current_prop_functor_internal(std::forward<key_t>(key), std::forward<getter_t>(getter));
@@ -2125,16 +2107,16 @@ namespace iris {
 		}
 
 		template <typename stream_t>
-		static bool encode_recursion(lua_State* L, stream_t& bytes, int index, int recursionTable) {
+		static bool encode_recursion(lua_State* L, stream_t& bytes, int index, int recursion_table) {
 			lua_pushvalue(L, index);
-			lua_rawget(L, recursionTable);
+			lua_rawget(L, recursion_table);
 
 			if (lua_isnil(L, -1)) {
 				lua_pop(L, 1);
 				lua_pushvalue(L, index);
 				lua_Integer offset = bytes.size();
 				lua_pushinteger(L, offset);
-				lua_rawset(L, recursionTable);
+				lua_rawset(L, recursion_table);
 				return false;
 			} else {
 				lua_Integer offset = lua_tointeger(L, -1);
@@ -2146,7 +2128,7 @@ namespace iris {
 		}
 
 		template <typename encoder_t, typename stream_t>
-		static void encode_internal(lua_State* L, stream_t& bytes, int index, const encoder_t& encoder, int recursionTable) {
+		static void encode_internal(lua_State* L, stream_t& bytes, int index, const encoder_t& encoder, int recursion_table) {
 			int type = lua_type(L, index);
 			switch (type) {
 				case LUA_TNONE:
@@ -2163,8 +2145,8 @@ namespace iris {
 				case LUA_TNUMBER:
 				{
 #if LUA_VERSION_NUM >= 503
-					bool isInteger = lua_isinteger(L, index);
-					if (isInteger) {
+					bool is_integer = lua_isinteger(L, index);
+					if (is_integer) {
 						bytes.push(uint8_t(LUA_TNUMBER | spec_type_tag));
 						lua_Integer value = lua_tointeger(L, index);
 						bytes.push(reinterpret_cast<const uint8_t*>(&value), reinterpret_cast<const uint8_t*>(&value) + sizeof(value));
@@ -2181,7 +2163,7 @@ namespace iris {
 				}
 				case LUA_TSTRING:
 				{
-					if (encode_recursion(L, bytes, index, recursionTable)) {
+					if (encode_recursion(L, bytes, index, recursion_table)) {
 						break;
 					}
 
@@ -2195,7 +2177,7 @@ namespace iris {
 				}
 				case LUA_TTABLE:
 				{
-					if (encode_recursion(L, bytes, index, recursionTable)) {
+					if (encode_recursion(L, bytes, index, recursion_table)) {
 						break;
 					}
 
@@ -2204,8 +2186,8 @@ namespace iris {
 						lua_pushnil(L);
 						lua_checkstack(L, 4);
 						while (lua_next(L, index) != 0) {
-							encode_internal(L, bytes, lua_absindex(L, -2), encoder, recursionTable);
-							encode_internal(L, bytes, lua_absindex(L, -1), encoder, recursionTable);
+							encode_internal(L, bytes, lua_absindex(L, -2), encoder, recursion_table);
+							encode_internal(L, bytes, lua_absindex(L, -1), encoder, recursion_table);
 							lua_pop(L, 1);
 						}
 
@@ -2219,7 +2201,7 @@ namespace iris {
 				case LUA_TFUNCTION:
 				case LUA_TTHREAD:
 				{
-					if (encode_recursion(L, bytes, index, recursionTable)) {
+					if (encode_recursion(L, bytes, index, recursion_table)) {
 						break;
 					}
 
@@ -2266,7 +2248,7 @@ namespace iris {
 									if (name != nullptr && strcmp(name, "_ENV") == 0) {
 										bytes.push(LUA_TNONE); // mark for global env
 									} else {
-										encode_internal(L, bytes, lua_absindex(L, -1), encoder, recursionTable);
+										encode_internal(L, bytes, lua_absindex(L, -1), encoder, recursion_table);
 									}
 
 									lua_pop(L, 1);
@@ -2316,11 +2298,11 @@ namespace iris {
 			return value;
 		}
 
-		static void mark_recursion(lua_State* L, lua_Integer offset, int recursionTable) {
+		static void mark_recursion(lua_State* L, lua_Integer offset, int recursion_table) {
 			if (lua_type(L, -1) != LUA_TNIL) {
 				lua_pushinteger(L, offset);
 				lua_pushvalue(L, -2);
-				lua_rawset(L, recursionTable);
+				lua_rawset(L, recursion_table);
 			}
 		}
 
@@ -3655,7 +3637,8 @@ namespace iris {
 			using value_t = decltype(object->*prop);
 			stack_guard_t guard(L, 1);
 			push_variable(L, object->*prop); // return the property value
-			return 1;		}
+			return 1;
+		}
 
 		template <auto prop, typename type_t>
 		static int property_get_proxy(lua_State* L) {
@@ -3684,9 +3667,7 @@ namespace iris {
 			return property_set_proxy_dispatch<decltype(prop), type_t>(L, prop);
 		}
 
-		// decompose a getter/setter callable (member function pointer or a free
-		// function pointer taking the owner as its first parameter) used by
-		// set_current_prop, following the four [const][noexcept] member specs
+		// decompose member/free function pointers used by set_current_prop
 		template <typename ptr_t>
 		struct member_callable_traits_t;
 
@@ -3738,14 +3719,12 @@ namespace iris {
 			return 1;
 		}
 
-		// __set entry for getter-only properties: report an error instead of
-		// letting the assignment silently no-op (matches the const member behavior)
+		// __set entry for getter-only properties: fail loudly instead of no-opping
 		static int property_readonly_set_proxy(lua_State* L) {
 			return syserror(L, "error.exec", "Cannot modify a read-only property.\n");
 		}
 
-		// decompose a getter/setter functor signature: the first parameter is the
-		// owner (T* or T&), setters take exactly one additional value parameter
+		// decompose a property functor signature: the first parameter is the owner
 		template <typename functor_t>
 		struct functor_property_traits_t;
 
@@ -3771,8 +3750,7 @@ namespace iris {
 			std::remove_pointer_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>,
 			std::remove_reference_t<std::tuple_element_t<0, typename functor_property_traits_t<decltype(&functor_t::operator ())>::args_tuple>>>;
 
-		// create a userdata holding a moved/copyed functor with __gc if needed,
-		// mirroring push_functor_internal's storage (used as closure upvalue)
+		// create a userdata holding the functor, used as closure upvalue
 		template <typename functor_t>
 		static void push_property_functor(lua_State* L, functor_t&& functor) {
 			using value_t = remove_cvref_t<functor_t>;
@@ -3812,8 +3790,7 @@ namespace iris {
 			return 1;
 		}
 
-		// __set entry for functor setters: upvalue 1 holds the functor userdata,
-		// value is read from stack index 3 (index 2 holds the key)
+		// __set entry for functor setters: upvalue 1 holds the functor userdata
 		template <typename owner_t, typename setter_t>
 		static int property_functor_set_proxy(lua_State* L) {
 			setter_t* functor = reinterpret_cast<setter_t*>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -3841,8 +3818,7 @@ namespace iris {
 			return 0;
 		}
 
-		// __set entry generated by set_current_prop: calls a custom setter with
-		// the value at stack index 3 (index 2 holds the key, as in property_set_proxy)
+		// __set entry generated by set_current_prop: calls a custom setter
 		template <auto setter, typename subtype_t>
 		static int property_custom_set_proxy(lua_State* L) {
 			using traits_t = member_callable_traits_t<decltype(setter)>;
@@ -3878,8 +3854,7 @@ namespace iris {
 			using owner = class_t;
 		};
 
-		// __get entry generated by set_current_proxy: pushes a proxy userdata referencing
-		// the member container embedded in the owner (index 1), anchored against GC
+		// __get entry generated by set_current_proxy: pushes a proxy over the member container
 		template <auto ptr, typename subtype_t>
 		static int property_proxy_get_proxy(lua_State* L) {
 			using traits_t = member_object_traits_t<decltype(ptr)>;
@@ -3894,8 +3869,8 @@ namespace iris {
 			return push_proxy_view_variable<proxy_view_t<member_t>>(L, &(object->*ptr), lua_absindex(L, 1));
 		}
 
-		// __set entry generated by set_current_proxy: whole-container assignment, accepting
-		// either a proxy of the same container type (view or owned clone) or a lua table
+		// __set entry generated by set_current_proxy: whole-container assignment,
+		// accepting a proxy of the same container type or a lua table
 		template <auto ptr, typename subtype_t>
 		static int property_proxy_set_proxy(lua_State* L) {
 			using traits_t = member_object_traits_t<decltype(ptr)>;
@@ -3922,7 +3897,6 @@ namespace iris {
 					while (!member.empty()) {
 						member.pop();
 					}
-
 					size_t len = static_cast<size_t>(lua_rawlen(L, 3));
 					for (size_t i = 0; i < len; i++) {
 						lua_rawgeti(L, 3, static_cast<int>(i) + 1);
@@ -3932,16 +3906,14 @@ namespace iris {
 				} else {
 					member = get_variable<member_t>(L, 3);
 				}
-
 				return 0;
 			}
 
 			return syserror(L, "error.parameter", "Unable to assign property, expected a proxy of %s or a lua table.\n", get_lua_name<member_t>());
 		}
 
-		// push a proxy_view_t userdata referencing a container embedded in its owner.
-		// owner_index != 0 anchors the owner lua object so it cannot be collected while
-		// the proxy lives: uservalue on 5.4+, registry ref on older versions (no uservalues).
+		// push a proxy_view_t userdata referencing a container embedded in its owner,
+		// owner_index != 0 anchors the owner lua object against GC
 		template <typename proxy_t>
 		static int push_proxy_view_variable(lua_State* L, typename proxy_t::container_t* container, int owner_index) {
 			IRIS_ASSERT(container != nullptr);
@@ -3976,8 +3948,7 @@ namespace iris {
 			return 1;
 		}
 
-		// push an owned proxy_view_t userdata holding a copy of the container (clone),
-		// the container is stored in the userdata payload behind the proxy header
+		// push an owned proxy_view_t userdata holding a copy of the container (clone)
 		template <typename proxy_t>
 		static int push_proxy_owned_variable(lua_State* L, const typename proxy_t::container_t& source) {
 			using container_t = typename proxy_t::container_t;
@@ -4177,30 +4148,20 @@ namespace iris {
 		}
 
 		// transfer a variable between different states
-		//
-		// only tables can enter the cycle registry: each table is registered before its
-		// members transfer, so table cycles terminate at the registry lookup. functions
-		// cannot be registered: lua closures are rebuilt from a bytecode dump, C closures
-		// are recreated from transferred upvalue values, neither shares identity with the
-		// source. a cycle through function upvalues therefore recurses without bound, and
-		// cross_transfer_max_depth is the only guard against it: past the limit the value
-		// transfers as nil with a systrap report instead of a native stack overflow.
-		// _ENV upvalues are replaced with the target's own globals table - the source
-		// state's globals table is never transferred.
+		// cycles through function upvalues cannot enter the cycle registry (closures are rebuilt,
+		// not shared), so cross_transfer_max_depth is the only guard: past it the value transfers
+		// as nil with a systrap report instead of a native stack overflow
 		static constexpr int cross_transfer_max_depth = 64;
 		template <bool move, typename lua_t>
 		static int cross_transfer_variable(lua_State* L, lua_t& target, int index, int recursion_source, int recursion_target, int recursion_index, int depth = 0) {
 			stack_guard_t guard(L);
 			lua_State* T = target.get_state();
 			stack_guard_t guard_target(T, 1);
-			// each recursion level leaves values on both stacks (held upvalues on L,
-			// rebuilt closures on T, the nil from the depth guard), so both frame
-			// budgets must grow with the depth
+			// both stack budgets grow with the recursion depth
 			lua_checkstack(L, 8);
 			lua_checkstack(T, 8);
 
-			// no registry entry can stop a cycle through function upvalues: past the
-			// limit the value transfers as nil instead of exhausting the native stack
+			// past the limit the value transfers as nil instead of exhausting the native stack
 			if (depth > cross_transfer_max_depth) {
 				target.native_push_variable(nullptr);
 				systrap(L, "error.cross", "cross_transfer_variable() -> crossing depth limit exceeded (cross_transfer_max_depth = %d); "
@@ -4508,24 +4469,18 @@ namespace iris {
 		lua_State* state = nullptr;
 	};
 
-	// reference proxy over a container embedded in a registered object.
-	// - view form (set_current_proxy): ptr references the owner's member in place,
-	//   a.vector[i] = 5 writes through to the original container, no read-modify-write;
-	// - owned form (clone): ptr references a copy stored in the userdata payload.
-	// methods live in the metatable only (getmetatable(p).push_back(p, v)) so data keys
-	// are never shadowed by library names; __index/__newindex do pure data-key dispatch.
-	// iteration is snapshot-based (keys/values/items) to sidestep iterator invalidation,
-	// sequences can also use plain 'for i = 1, #p do p[i] end'.
-	// proxies are per-VM transient views: not copyable, not transferable.
+	// reference proxy over a container embedded in a registered object:
+	// view form (set_current_proxy) references the owner's member in place,
+	// owned form (clone) holds a copy in the userdata payload.
+	// methods live in the metatable only, so data keys are never shadowed by library names,
+	// and proxies are per-VM transient views: not copyable, not transferable
 	template <typename container_type>
 	struct proxy_view_t {
 		using container_t = container_type; // may be const for read-only views
 		using mutable_container_t = std::remove_const_t<container_type>;
 		static constexpr bool const_view = std::is_const_v<container_type>;
 		static constexpr bool map_view = iris_is_map<mutable_container_t>::value;
-		// queue/heap faces take precedence over the iterable sequence face detection
-		// would otherwise be ambiguous: they are disjoint container shapes (no operator[],
-		// no begin/end for std::queue/priority_queue), checked before the sequence branch.
+		// queue/heap faces are disjoint from the sequence face, so they take precedence
 		static constexpr bool queue_view = !map_view && iris_is_queue<mutable_container_t>::value;
 		static constexpr bool heap_view = !map_view && !queue_view && iris_is_heap<mutable_container_t>::value;
 		static constexpr bool sequence_view = !map_view && !queue_view && !heap_view;
@@ -4561,8 +4516,6 @@ namespace iris {
 			}
 #endif
 		}
-
-		// ---- metamethods ----
 
 		static int lua_len(lua_State* L) {
 			proxy_view_t* self = get_self(L);
@@ -4665,8 +4618,6 @@ namespace iris {
 			}
 		}
 
-		// ---- shared methods ----
-
 		static int lua_size(lua_State* L) {
 			proxy_view_t* self = get_self(L);
 			if (self == nullptr) {
@@ -4701,7 +4652,6 @@ namespace iris {
 			} else {
 				self->ptr->clear();
 			}
-
 			return 0;
 		}
 
@@ -4714,13 +4664,10 @@ namespace iris {
 			if constexpr (std::is_copy_constructible_v<mutable_container_t>) {
 				return iris_lua_t::push_proxy_owned_variable<proxy_view_t<mutable_container_t>>(L, *self->ptr);
 			} else {
-				// move-only containers (e.g. iris_queue_list_t) cannot be cloned,
-				// the clone entry is not registered in lua_registar either
+				// move-only containers cannot be cloned
 				return lua_self_error(L);
 			}
 		}
-
-		// ---- queue/heap methods ----
 
 		static int lua_front(lua_State* L) {
 			proxy_view_t* self = get_self(L);
@@ -4812,8 +4759,6 @@ namespace iris {
 				return lua_self_error(L);
 			}
 		}
-
-		// ---- sequence methods ----
 
 		static int lua_at(lua_State* L) {
 			proxy_view_t* self = get_self(L);
@@ -4959,8 +4904,6 @@ namespace iris {
 			}
 		}
 
-		// ---- map methods ----
-
 		static int lua_count(lua_State* L) {
 			proxy_view_t* self = get_self(L);
 			if (self == nullptr) {
@@ -5028,17 +4971,14 @@ namespace iris {
 			return 1;
 		}
 
-		// ---- registration ----
-
 		template <typename traits_t>
 		static void lua_registar(iris_lua_t lua, traits_t) {
 			lua.set_current<&proxy_view_t::lua_len>("__len");
 			lua.set_current<&proxy_view_t::lua_index>("__index");
-			// always override the default __newindex installed by make_type: const views
-			// must report an error instead of silently dropping the assignment
+			// always override the default __newindex installed by make_type
 			lua.set_current<&proxy_view_t::lua_newindex>("__newindex");
 
-			// methods are only reachable through the metatable: getmetatable(p).push_back(p, v)
+			// methods are metatable-only: getmetatable(p).push_back(p, v)
 			lua.set_current<&proxy_view_t::lua_size>("size");
 			lua.set_current<&proxy_view_t::lua_empty>("empty");
 			if constexpr (std::is_copy_constructible_v<mutable_container_t>) {
@@ -5055,12 +4995,11 @@ namespace iris {
 					lua.set_current<&proxy_view_t::lua_erase>("erase");
 					lua.set_current<&proxy_view_t::lua_clear>("clear");
 				}
-				} else if constexpr (queue_view) {
+			} else if constexpr (queue_view) {
 				lua.set_current<&proxy_view_t::lua_front>("front");
 				if constexpr (iris_is_backable<mutable_container_t>::value) {
 					lua.set_current<&proxy_view_t::lua_back>("back");
 				}
-
 				if constexpr (!const_view) {
 					lua.set_current<&proxy_view_t::lua_push>("push");
 					lua.set_current<&proxy_view_t::lua_queue_pop>("pop");
