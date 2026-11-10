@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -928,6 +929,281 @@ static void test_warp_suspend_resume_storm() {
 	while (warp_t::poll(warps.begin(), warps.end())) {}
 }
 
+// Test 5b: iris_warp_t suspend/resume queueing contract, deterministic part.
+//   * tasks posted while nested-suspended must not run before the FINAL resume
+//   * the final resume must drain the whole backlog
+//   * a post landing while the warp is parked in `pending` (the parked
+//     execute_t skipped, queueing left pending) must not be swallowed
+//   * afterwards the warp must accept fresh work at once (terminal-state
+//     liveness: queueing back to idle, nothing stranded in the buffers)
+static bool warp_wait_for(std::chrono::milliseconds timeout, const std::function<bool()>& pred) {
+	auto deadline = std::chrono::steady_clock::now() + timeout;
+	while (!pred()) {
+		if (std::chrono::steady_clock::now() > deadline) {
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	return true;
+}
+
+static void test_warp_suspend_backlog() {
+	worker_t worker(2);
+	worker.start();
+	warp_t warp(worker);
+	const size_t count = 100;
+	std::atomic<size_t> done{ 0 };
+
+	// nested suspend: only the resume that brings suspend_count to zero
+	// is allowed to (re-)start execution
+	warp.suspend();
+	warp.suspend();
+	for (size_t i = 0; i < count; i++) {
+		warp.queue_routine_post([&done]() {
+			done.fetch_add(1, std::memory_order_release);
+		});
+	}
+
+	// non-final resume: nothing may run (the posted backlog stays parked)
+	warp.resume();
+	if (!warp_wait_for(std::chrono::milliseconds(100), [&done]() { return false; }) &&
+		done.load(std::memory_order_acquire) != 0) {
+		throw std::runtime_error("non-final resume executed parked tasks");
+	}
+
+	// while parked in pending, an extra post must not be swallowed
+	warp.queue_routine_post([&done]() {
+		done.fetch_add(1, std::memory_order_release);
+	});
+
+	// final resume: the whole backlog (count + 1) must drain
+	warp.resume();
+	if (!warp_wait_for(std::chrono::seconds(2), [&done, count]() {
+		return done.load(std::memory_order_acquire) == count + 1;
+	})) {
+		printf("  backlog drained %zu/%zu\n", done.load(std::memory_order_acquire), count + 1);
+		throw std::runtime_error("suspend backlog lost tasks on final resume");
+	}
+
+	// terminal-state liveness probe: a fresh task must run immediately;
+	// a warp stranded in pending/executing with no executor swallows it
+	std::atomic<bool> probed{ false };
+	warp.queue_routine_post([&probed]() { probed.store(true, std::memory_order_release); });
+	if (!warp_wait_for(std::chrono::milliseconds(500), [&probed]() { return probed.load(std::memory_order_acquire); })) {
+		throw std::runtime_error("warp lost terminal liveness after backlog drain");
+	}
+
+	worker.terminate();
+	worker.join();
+	while (warp_t::poll({ std::ref(warp) })) {}
+}
+
+// Test 5c: iris_warp_t interrupt/drain race, targeted regression for the
+// lost wakeup fixed in "Re-publish warp queue as pending when execution is
+// interrupted by suspend": execute_internal() early-returns between tasks
+// when an external suspend() lands on a check point while the buffers still
+// hold work; if the final resume() slips into the window before the
+// executor's yield(), neither side re-flushed and the remaining tasks
+// starved forever. The storm test above hits it with ~5% per run; here the
+// agitator is dense (1us period) and every round ends with a liveness probe
+// so the stale-pending state is caught within milliseconds instead of a
+// 5s deadline.
+static void test_warp_interrupt_drain() {
+	const size_t rounds = 20;
+	const size_t warp_count = 4;
+	const size_t count_per_warp = 500;
+
+	for (size_t r = 0; r < rounds; r++) {
+		worker_t worker(4);
+		worker.start();
+		std::vector<warp_t> warps;
+		warps.reserve(warp_count);
+		for (size_t i = 0; i < warp_count; i++) warps.emplace_back(worker);
+
+		const size_t total = warp_count * count_per_warp;
+		std::atomic<size_t> done{ 0 };
+		std::atomic<bool> stop{ false };
+
+		std::thread agitator([&]() {
+			std::mt19937 rng(123);
+			while (!stop.load(std::memory_order_acquire)) {
+				warp_t& w = warps[rng() % warp_count];
+				w.suspend();
+				std::this_thread::sleep_for(std::chrono::microseconds(rng() % 10));
+				w.resume();
+			}
+		});
+
+		// rescue: a dense agitator can park an executor in `pending` for a
+		// long time (starvation -- recoverable), while the lost wakeup leaves
+		// the warp in `idle` with no executor at all (permanent). Stopping
+		// the agitator and forcing one FINAL resume cycle flushes the former;
+		// the latter stays dead, which is exactly what we report.
+		auto rescue = [&]() {
+			if (!stop.exchange(true, std::memory_order_acq_rel)) {
+				agitator.join();
+			}
+
+			for (size_t i = 0; i < warp_count; i++) {
+				warps[i].suspend();
+				warps[i].resume();
+			}
+		};
+
+		for (size_t i = 0; i < total; i++) {
+			warps[i % warp_count].queue_routine_post([&done]() {
+				done.fetch_add(1, std::memory_order_release);
+			});
+		}
+
+		// phase 1: drain with stall detection
+		size_t last_done = 0;
+		auto last_progress = std::chrono::steady_clock::now();
+		while (done.load(std::memory_order_acquire) != total) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			size_t d = done.load(std::memory_order_acquire);
+			if (d != last_done) {
+				last_done = d;
+				last_progress = std::chrono::steady_clock::now();
+			} else if (std::chrono::steady_clock::now() - last_progress > std::chrono::seconds(1)) {
+				rescue();
+				if (!warp_wait_for(std::chrono::seconds(2), [&done, total]() {
+					return done.load(std::memory_order_acquire) == total;
+				})) {
+					printf("  round %zu: stalled at %zu/%zu after rescue (lost wakeup)\n", r,
+						done.load(std::memory_order_acquire), total);
+					worker.terminate();
+					worker.join();
+					while (warp_t::poll(warps.begin(), warps.end())) {}
+					throw std::runtime_error("interrupted drain lost its wakeup");
+				}
+
+				break;
+			}
+		}
+
+		// phase 2: terminal liveness probe on every warp, with rescue
+		std::atomic<size_t> probed{ 0 };
+		for (size_t i = 0; i < warp_count; i++) {
+			warps[i].queue_routine_post([&probed]() { probed.fetch_add(1, std::memory_order_release); });
+		}
+		if (!warp_wait_for(std::chrono::seconds(1), [&probed, warp_count]() {
+			return probed.load(std::memory_order_acquire) == warp_count;
+		})) {
+			rescue();
+			if (!warp_wait_for(std::chrono::seconds(1), [&probed, warp_count]() {
+				return probed.load(std::memory_order_acquire) == warp_count;
+			})) {
+				printf("  round %zu: %zu/%zu probes ran after rescue\n", r,
+					probed.load(std::memory_order_acquire), warp_count);
+				worker.terminate();
+				worker.join();
+				while (warp_t::poll(warps.begin(), warps.end())) {}
+				throw std::runtime_error("interrupted drain stranded a warp");
+			}
+		}
+
+		if (!stop.exchange(true, std::memory_order_acq_rel)) {
+			agitator.join();
+		}
+
+		worker.terminate();
+		worker.join();
+		while (warp_t::poll(warps.begin(), warps.end())) {}
+	}
+}
+
+// Test 5d: iris_warp_t same race from the poster side: several worker
+// threads push while an external agitator suspends/resumes, so the
+// push-side flush() competes with resume()/yield() for the pending flag
+// instead of a single external poster routing everything through the pool.
+static void test_warp_concurrent_post_interrupt() {
+	worker_t worker(4);
+	worker.start();
+	warp_t warp(worker);
+	const size_t per_poster = 500;
+	std::atomic<size_t> done{ 0 };
+	std::atomic<bool> stop{ false };
+
+	std::thread agitator([&]() {
+		std::mt19937 rng(456);
+		while (!stop.load(std::memory_order_acquire)) {
+			warp.suspend();
+			std::this_thread::sleep_for(std::chrono::microseconds(rng() % 10));
+			warp.resume();
+		}
+	});
+
+	// rescue (see test_warp_interrupt_drain): a final resume cycle after the
+	// agitator stops recovers a merely starved warp (pending parked), but
+	// cannot recover a lost wakeup (idle, no executor)
+	auto rescue = [&]() {
+		if (!stop.exchange(true, std::memory_order_acq_rel)) {
+			agitator.join();
+		}
+
+		warp.suspend();
+		warp.resume();
+	};
+
+	for (int p = 0; p < 2; p++) {
+		worker.queue([&warp, &done, per_poster]() {
+			for (size_t i = 0; i < per_poster; i++) {
+				warp.queue_routine_post([&done]() {
+					done.fetch_add(1, std::memory_order_release);
+				});
+			}
+		});
+	}
+
+	// phase 1: drain with stall detection + rescue
+	size_t last_done = 0;
+	auto last_progress = std::chrono::steady_clock::now();
+	while (done.load(std::memory_order_acquire) != 2 * per_poster) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		size_t d = done.load(std::memory_order_acquire);
+		if (d != last_done) {
+			last_done = d;
+			last_progress = std::chrono::steady_clock::now();
+		} else if (std::chrono::steady_clock::now() - last_progress > std::chrono::seconds(1)) {
+			rescue();
+			if (!warp_wait_for(std::chrono::seconds(2), [&done, per_poster]() {
+				return done.load(std::memory_order_acquire) == 2 * per_poster;
+			})) {
+				printf("  stalled at %zu/%zu after rescue (lost wakeup)\n",
+					done.load(std::memory_order_acquire), 2 * per_poster);
+				worker.terminate();
+				worker.join();
+				while (warp_t::poll({ std::ref(warp) })) {}
+				throw std::runtime_error("concurrent post drain lost its wakeup");
+			}
+
+			break;
+		}
+	}
+
+	// phase 2: terminal liveness probe with rescue
+	std::atomic<bool> probed{ false };
+	warp.queue_routine_post([&probed]() { probed.store(true, std::memory_order_release); });
+	if (!warp_wait_for(std::chrono::seconds(1), [&probed]() { return probed.load(std::memory_order_acquire); })) {
+		rescue();
+		if (!warp_wait_for(std::chrono::seconds(1), [&probed]() { return probed.load(std::memory_order_acquire); })) {
+			worker.terminate();
+			worker.join();
+			while (warp_t::poll({ std::ref(warp) })) {}
+			throw std::runtime_error("concurrent post drain stranded the warp");
+		}
+	}
+
+	if (!stop.exchange(true, std::memory_order_acq_rel)) {
+		agitator.join();
+	}
+
+	worker.terminate();
+	worker.join();
+	while (warp_t::poll({ std::ref(warp) })) {}
+}
+
 // Test 6: iris_event_t - repeated notify/reset cycles with many waiters.
 // helper as a regular function: GCC 12 lambda coroutines copy awaitables into the frame.
 template <typename event_t>
@@ -1055,6 +1331,9 @@ int main() {
 	if (!run_with_timeout("pipe SPSC race", stress_timeout, test_pipe_spsc_race)) failures++;
 	if (!run_with_timeout("dispatcher::next", short_timeout, test_dispatcher_next_handle)) failures++;
 	if (!run_with_timeout("warp suspend storm", stress_timeout, test_warp_suspend_resume_storm)) failures++;
+	if (!run_with_timeout("warp suspend backlog", short_timeout, test_warp_suspend_backlog)) failures++;
+	if (!run_with_timeout("warp interrupt drain", stress_timeout, test_warp_interrupt_drain)) failures++;
+	if (!run_with_timeout("warp concurrent post", stress_timeout, test_warp_concurrent_post_interrupt)) failures++;
 	if (!run_with_timeout("event reset/notify", stress_timeout, test_event_cycle)) failures++;
 
 	printf("\n==== %d failure(s) ====\n", failures);
