@@ -17,6 +17,7 @@ Header-only C++ async framework (M:N warp scheduler, C++20 coroutines, Lua 5.5 b
 3. Concurrency is designed top-down with the warp/dispatcher model: declare parallel vs serial boundaries and rely on the scheduler for mutual exclusion; do not use local blocking primitives (blocking waits, hand-rolled mutexes, condition-variable loops) as the primary coordination mechanism; every shared container reachable from multiple threads must declare an ownership + synchronization protocol.
 4. Unless necessary, do not add global variables or rely on global initialization/termination logic; the program must always exit cleanly from its entry point without memory or resource leaks.
 5. Lua binding: coroutine methods must switch back to the original warp before finishing; failures are returned as `result_error_t`, never `lua.syserror`; `ref_t` must be deref'ed before destruction. Registered (`lua_registar`) type args: by value and `T&&` both move-construct (take the object, require move-constructible, leave the Lua object moved-from), `T&`/`const T&` are plain references (no copy/move).
+6. C++ -> Lua calls must not yield across the call boundary; do not expose `callk`/`pcallk` wrappers (even native ones), since only internal `yieldk` has a closed lifecycle owned by the C++ async operation: coroutine pinning, resumption and reference release.
 
 ## Async pattern choice (best practice, not enforced)
 
