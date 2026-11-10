@@ -689,6 +689,11 @@ namespace iris {
 					execute_counter++;
 
 					if ((!force && is_suspended()) || *warp_ptr != this) {
+						// interrupted: the queue may still hold tasks, so re-publish
+						// as pending -- otherwise a concurrent final resume() can
+						// exchange executing -> idle and neither side re-flushes
+						// (lost wakeup, the remaining tasks would starve forever).
+						queueing.store(queue_state_t::pending, std::memory_order_relaxed);
 						return;
 					}
 
@@ -730,8 +735,14 @@ namespace iris {
 						execute_counter++;
 						counter = next_version;
 
-						if ((!force && is_suspended()) || *warp_ptr != this)
+						if ((!force && is_suspended()) || *warp_ptr != this) {
+							// interrupted: the queue may still hold tasks, so re-publish
+							// as pending -- otherwise a concurrent final resume() can
+							// exchange executing -> idle and neither side re-flushes
+							// (lost wakeup, the remaining tasks would starve forever).
+							queueing.store(queue_state_t::pending, std::memory_order_relaxed);
 							return;
+						}
 					}
 
 					if (current_version + 1 == counter) {
