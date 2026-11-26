@@ -37,6 +37,14 @@ IF (EMSCRIPTEN)
 	SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s USE_PTHREADS=1")
 	SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s PTHREAD_POOL_SIZE=16")
 	SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s SHARED_MEMORY=1")
+	# The test harness blocks the calling thread on futures. Under Emscripten
+	# every pthread_create issued from a worker has to be proxied to and
+	# serviced by the JS main thread; if main() itself is blocked there, thread
+	# creation deadlocks (seen in the 16-thread barrier stress test). Running
+	# main() on a pthread leaves the JS main thread free to service those
+	# proxies. EXIT_RUNTIME makes the process actually exit once main returns.
+	SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s PROXY_TO_PTHREAD")
+	SET (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s EXIT_RUNTIME=1")
 ENDIF (EMSCRIPTEN)
 
 MESSAGE (STATUS "Current platform: ${CMAKE_GENERATOR_PLATFORM}")
@@ -229,4 +237,3 @@ IF (ENABLE_LUA)
 		TARGET_LINK_LIBRARIES (iris_lua_demo m ${STDLIB} ${LUALIB})
 	ENDIF (MSVC)
 ENDIF (ENABLE_LUA)
-
