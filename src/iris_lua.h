@@ -3554,6 +3554,7 @@ namespace iris {
 				}
 			}
 
+			const int base = lua_gettop(L);
 			int count = 0;
 			if ((count = function_coroutine_invoke<function_t, use_this, 0, coroutine_t, std::tuple<cast_arg_type_t<args_t>...>>(L, function, env_count, 1)) >= 0) {
 				return count;
@@ -3566,7 +3567,7 @@ namespace iris {
 #if IRIS_LUA_ENABLE_YIELDK
 					// after Lua 5.3, we can throw errors on C-coroutine via lua_yieldk directly
 					// so it can be captured within current pcall() context
-					return IRIS_LUA_YIELDK(L, 0, lua_gettop(L), &iris_lua_t::function_coroutine_continuation);
+					return IRIS_LUA_YIELDK(L, 0, base, &iris_lua_t::function_coroutine_continuation);
 #else
 					// however if you use a lower version (including LuaJIT),
 					// since C-continuation from yielding point is not possible, we cannot resume the coroutine anymore as C-error happends,

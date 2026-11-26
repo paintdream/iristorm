@@ -1,4 +1,4 @@
-#include "../src/iris_lua.h"
+﻿#include "../src/iris_lua.h"
 #include "../src/iris_common.inl"
 #include <map>
 #include <chrono>
@@ -189,6 +189,7 @@ struct example_t : example_base_t {
 		lua.set_current<&example_t::coro_get_none>("coro_get_none");
 		lua.set_current<&example_t::mem_coro_get_int>("mem_coro_get_int");
 		lua.set_current<&example_t::mem_coro_get_int_raw>("mem_coro_get_int_raw");
+		lua.set_current<&example_t::mem_coro_temporaries>("mem_coro_temporaries");
 #endif
 	}
 
@@ -390,6 +391,22 @@ struct example_t : example_base_t {
 	static int mem_coro_get_int_raw(lua_State* L) {
 		return lua_t::forward(L, &example_t::mem_coro_get_int);
 	}
+		// Regression (2026-11-26): a coroutine method may push TEMPORARIES onto the
+		// Lua stack before its first suspension (PaintsNow's LockStep::StepFrame
+		// pushes the frame number and the input table for a nested bridge call).
+		// The yield context used to be lua_gettop(L) AT YIELD TIME - too large by
+		// the temporaries - so the resumed continuation computed a negative result
+		// count, the VM raised "table overflow" and the caller received nothing.
+		iris::iris_coroutine_t<lua_t::optional_result_t<int>> mem_coro_temporaries(iris_lua_t&& t) noexcept {
+			lua_State* L = t.get_state();
+			int top = lua_gettop(L);
+			t.native_push_variable(101); // the temporaries, as a nested call's arguments would be
+			t.native_push_variable(102);
+			co_await iris::iris_switch(warpptr2);
+			co_await iris::iris_switch(warpptr);
+			lua_settop(L, top); // consumed before the method returns
+			co_return 7;
+		}
 #endif
 
 	std::string_view get_prop_value() const {
@@ -996,6 +1013,8 @@ static void test_coroutines(lua_t lua) {
 			print('memcoro get ' .. x1 .. ', ' .. x2) \n\
 			print('memcoro get second ' .. a:mem_coro_get_int('world')) \n\
 			print('memcoro get second ' .. a:mem_coro_get_int_raw('world')) \n\
+			local r1, r2 = a:mem_coro_temporaries() \n\
+			tempcoro_r1, tempcoro_r2 = r1, r2 print('tempcoro r1', r1, 'r2', r2) \n\
 			a.coro_get_none()\n\
 			print('coro finished')\n\
 		end)\n\
@@ -1011,6 +1030,8 @@ static void test_coroutines(lua_t lua) {
 			print('memcoro get ' .. x1 .. ', ' .. x2) \n\
 			print('memcoro get second ' .. a:mem_coro_get_int('world')) \n\
 			print('memcoro get second ' .. a:mem_coro_get_int_raw('world')) \n\
+			local r1, r2 = a:mem_coro_temporaries() \n\
+			tempcoro_r1, tempcoro_r2 = r1, r2 print('tempcoro r1', r1, 'r2', r2) \n\
 			end) \n\
 			print(status, message) \n\
 			a.coro_get_none()\n\
@@ -1036,6 +1057,13 @@ static void test_coroutines(lua_t lua) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	}
 
+	// Regression: the temporaries pushed before the first suspension must not
+	// cost the caller its return values (the yield context is the proxy's ENTRY
+	// stack top, not the top at yield time)
+	auto tempcoro_r1 = lua.get_global<int>("tempcoro_r1");
+	auto tempcoro_r2 = lua.get_global<int>("tempcoro_r2");
+	IRIS_ASSERT(tempcoro_r1 && tempcoro_r1.value() == 7);
+	IRIS_ASSERT(!tempcoro_r2); // exactly one result: the continuation reports the real count
 	preempt_guard.cleanup();
 #endif
 }
