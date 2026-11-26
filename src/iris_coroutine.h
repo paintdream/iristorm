@@ -196,10 +196,22 @@ namespace iris {
 		// fiber around every resume (see IRIS_PROFILE_COROUTINE), so zones inside
 		// its body are attributed to its own fiber lane and may safely span
 		// co_await. Unnamed coroutines emit no fiber events.
-		iris_coroutine_t& named(const char* name) noexcept {
+		//
+		// Ref-qualified overloads: `co_await child().named(...)` names a
+		// temporary. With only an unqualified overload the operand is an
+		// lvalue reference to that temporary, and GCC materializes it into
+		// the awaiting coroutine frame with the (deleted) copy constructor.
+		// The && overload yields an rvalue so the temporary is moved instead.
+		iris_coroutine_t& named(const char* name) & noexcept {
 			IRIS_ASSERT(handle);
 			handle.promise().coro_identifier = name;
 			return *this;
+		}
+
+		iris_coroutine_t&& named(const char* name) && noexcept {
+			IRIS_ASSERT(handle);
+			handle.promise().coro_identifier = name;
+			return std::move(*this);
 		}
 
 		// run coroutine intermediately
