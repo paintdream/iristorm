@@ -2820,11 +2820,11 @@ namespace iris {
 		iris_queue_quick_list_t(const iris_queue_quick_list_t& rhs) = delete;
 		iris_queue_quick_list_t& operator = (const iris_queue_quick_list_t& rhs) = delete;
 
-		explicit iris_queue_quick_list_t(const node_allocator_t& allocator) noexcept(noexcept(std::declval<node_allocator_t>().allocate(1))) : base_t(allocator) {
+		explicit iris_queue_quick_list_t(const node_allocator_t& allocator) noexcept(noexcept(std::declval<node_allocator_t>().allocate(1))) : base_t(allocator), address_to_nodes(allocator), nodes(allocator) {
 			node_insert(base_t::pop_head);
 		}
 
-		iris_queue_quick_list_t() noexcept(noexcept(std::declval<node_allocator_t>().allocate(1))) : base_t() {
+		iris_queue_quick_list_t() noexcept(noexcept(std::declval<node_allocator_t>().allocate(1))) : base_t(), address_to_nodes(), nodes() {
 			node_insert(base_t::pop_head);
 		}
 		
@@ -2833,7 +2833,7 @@ namespace iris {
 			address_to_nodes.clear();
 		}
 
-		iris_queue_quick_list_t(iris_queue_quick_list_t&& rhs) noexcept : base_t(std::move(rhs)), nodes(std::move(rhs.nodes)), address_to_nodes(std::move(rhs.address_to_nodes)) {}
+		iris_queue_quick_list_t(iris_queue_quick_list_t&& rhs) noexcept : base_t(std::move(rhs)), address_to_nodes(std::move(rhs.address_to_nodes)), nodes(std::move(rhs.nodes)) {}
 		iris_queue_quick_list_t& operator = (iris_queue_quick_list_t&& rhs) noexcept {
 			base_t::operator = (std::move(rhs));
 			nodes = std::move(rhs.nodes);
@@ -2878,8 +2878,13 @@ namespace iris {
 		}
 
 	protected:
-		std::vector<iris_key_value_t<const void*, node_t*>> address_to_nodes;
-		std::vector<node_t*> nodes;
+		// The bookkeeping tables follow the SAME allocator as the node blocks,
+		// so a container on a ROUTED allocator (e.g. a snapshot region) keeps
+		// ALL of its storage there. Host-heap side tables reallocate when a
+		// node is added inside a rolled-back window and leave the restored
+		// control words pointing at freed memory (Space ECS, 2026-11-26).
+		std::vector<iris_key_value_t<const void*, node_t*>, debug_allocator_t<iris_key_value_t<const void*, node_t*>>> address_to_nodes;
+		std::vector<node_t*, debug_allocator_t<node_t*>> nodes;
 	};
 
 	// crtp-based resource handle reuse pool

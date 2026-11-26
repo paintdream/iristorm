@@ -1,4 +1,4 @@
-#include "../src/iris_system.h"
+﻿#include "../src/iris_system.h"
 #include "../src/iris_common.inl"
 #include <map>
 using namespace iris;
@@ -12,6 +12,51 @@ struct iris_component_matrix_t {
 
 template <typename element_t>
 using block_allocator_t = iris_block_allocator_t<element_t>;
+
+// Routed-allocator coverage (2026-11-26), see the end of main: a stateful
+// allocator that counts what the ECS routes through it
+struct counters_t {
+	size_t live = 0;
+	size_t total = 0;
+};
+
+template <typename element_t>
+struct counting_allocator_t : iris_block_allocator_t<element_t> {
+	using base_t = iris_block_allocator_t<element_t>;
+	using value_type = element_t;
+	using propagate_on_container_move_assignment = std::true_type;
+	using is_always_equal = std::false_type;
+
+	template <typename morph_t>
+	struct rebind { using other = counting_allocator_t<morph_t>; };
+
+	counters_t* counters = nullptr;
+
+	counting_allocator_t() noexcept {}
+	counting_allocator_t(counters_t& c) noexcept : counters(&c) {}
+	template <typename morph_t>
+	counting_allocator_t(const counting_allocator_t<morph_t>& rhs) noexcept : counters(rhs.counters) {}
+
+	bool operator==(const counting_allocator_t& rhs) const noexcept { return counters == rhs.counters; }
+	bool operator!=(const counting_allocator_t& rhs) const noexcept { return counters != rhs.counters; }
+
+	element_t* allocate(size_t n) {
+		if (counters != nullptr) {
+			counters->live++;
+			counters->total++;
+		}
+
+		return base_t::allocate(n);
+	}
+
+	void deallocate(element_t* p, size_t n) {
+		if (counters != nullptr) {
+			counters->live--;
+		}
+
+		base_t::deallocate(p, n);
+	}
+};
 
 struct int_interface : iris_pool_t<int_interface, iris_queue_quick_list_t<int*>> {
 	template <typename element_t>
@@ -406,6 +451,57 @@ int main(void) {
 		wide.clear();
 	}
 
+
+	// Routed-allocator coverage (2026-11-26): an ECS parameterized on a ROUTED
+	// allocator (a snapshot region in PaintsNow) must keep ALL of its storage on
+	// that allocator — the quick lists' node bookkeeping (nodes /
+	// address_to_nodes), the free-entity list and the systems hub's per-system
+	// index table included. A host-heap side table that reallocates inside a
+	// rolled-back window leaves restored control words pointing at freed memory.
+	// The type-level checks do not compile on the pre-fix layout (std::allocator
+	// side tables); the runtime pass exercises the stateful-allocator plumbing
+	// end to end (converting constructors, move-assignment with propagation,
+	// allocator equality) and proves every routed allocation is returned.
+	{
+		counters_t counters;
+
+		// type level: the side tables are on the ROUTED allocator
+		using quick_list_t = iris_queue_quick_list_t<int, counting_allocator_t>;
+		struct expose_t : quick_list_t {
+			using quick_list_t::nodes;
+			using quick_list_t::address_to_nodes;
+		};
+
+		static_assert(std::is_same_v<decltype(expose_t::nodes), std::vector<typename quick_list_t::node_t*, counting_allocator_t<typename quick_list_t::node_t*>>>);
+		static_assert(std::is_same_v<decltype(expose_t::address_to_nodes), std::vector<iris_key_value_t<const void*, typename quick_list_t::node_t*>, counting_allocator_t<iris_key_value_t<const void*, typename quick_list_t::node_t*>>>>);
+
+		using routed_systems_t = iris_systems_t<entity_t, counting_allocator_t, counting_allocator_t>;
+		using routed_info_t = typename routed_systems_t::system_info_t;
+		using routed_key_t = iris_key_value_t<size_t, void*>;
+		static_assert(std::is_same_v<decltype(std::declval<routed_info_t&>().components), std::vector<routed_key_t, counting_allocator_t<routed_key_t>>>);
+
+		// runtime: build a routed ECS large enough to add component-pool NODES
+		// (the bookkeeping tables must grow on the routed allocator), then make
+		// sure every allocation it made through the allocator is returned once
+		// the whole ECS is gone
+		counting_allocator_t<entity_t> routed(counters);
+		{
+			iris_entity_allocator_t<entity_t, counting_allocator_t> entity_allocator(routed);
+			routed_systems_t systems(routed, routed);
+			{
+				iris_system_t<entity_t, counting_allocator_t, counting_allocator_t, iris_component_matrix_t> matrix_system(routed, routed);
+				systems.attach(matrix_system);
+				for (size_t i = 0; i < 2000; i++) {
+					matrix_system.insert(entity_allocator.allocate(), iris_component_matrix_t());
+				}
+
+				IRIS_ASSERT(matrix_system.size() == 2000);
+				IRIS_ASSERT(counters.live != 0 && counters.total != 0);
+			}
+		}
+
+		IRIS_ASSERT(counters.live == 0);
+	}
 	return 0;
 }
 

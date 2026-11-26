@@ -417,6 +417,13 @@ namespace iris {
 
 	template <typename entity_t, template <typename...> class allocator_t = iris_default_block_allocator_t>
 	struct iris_entity_allocator_t : protected enable_in_out_fence_t<> {
+		iris_entity_allocator_t() = default;
+		// Route the free-entity list's storage through `allocator` (e.g. a
+		// snapshot region): the list's node blocks AND its bookkeeping then
+		// live where the allocator points, so a rollback restores both.
+		explicit iris_entity_allocator_t(const allocator_t<entity_t>& allocator) noexcept(noexcept(iris_queue_quick_list_t<entity_t, allocator_t>(std::declval<const typename iris_queue_quick_list_t<entity_t, allocator_t>::node_allocator_t&>())))
+			: free_entities(allocator) {}
+
 		entity_t allocate() noexcept(noexcept(std::declval<iris_entity_allocator_t>().free_entities.pop())) {
 			auto guard = in_fence();
 			if (!free_entities.empty()) {
@@ -460,13 +467,19 @@ namespace iris {
 		iris_systems_t() {}
 		iris_systems_t(const allocator_t<entity_t>& allocator, const vector_allocator_t<entity_t>& vector_allocator) : system_infos(vector_allocator) {}
 
+		// Every block of a system_info_t follows vector_allocator_t (the index
+		// table included), so a hub on a ROUTED allocator (a snapshot region)
+		// keeps ALL of its storage there — nothing host-heap to dangle after a
+		// rollback. The table is built with system_infos' own allocator instance.
+		using components_t = std::vector<iris_key_value_t<size_t, void*>, vector_allocator_t<iris_key_value_t<size_t, void*>>>;
+
 		struct system_info_t {
 			void* address = nullptr;
 			bool (*remove)(void*, entity_t) = nullptr;
 			void (*compress)(void*) = nullptr;
 			void (*clear)(void*) = nullptr;
 			std::vector<iris_key_value_t<entity_t, index_t>, vector_allocator_t<iris_key_value_t<entity_t, index_t>>>* entity_components = nullptr;
-			std::vector<iris_key_value_t<size_t, void*>> components;
+			components_t components;
 		};
 
 		template <typename system_t>
@@ -705,8 +718,9 @@ namespace iris {
 		}
 
 		template <typename system_t, size_t... i>
-		std::vector<iris_key_value_t<size_t, void*>> generate_info(system_info_t& info, system_t& sys, iris_sequence<i...>) {
-			return std::vector<iris_key_value_t<size_t, void*>>{ iris_make_key_value(get_type_hash<typename std::tuple_element<i, typename system_t::components_tuple_t>::type>(), reinterpret_cast<void*>(&sys.template component<typename std::tuple_element<i, typename system_t::components_tuple_t>::type>()))... };
+		components_t generate_info(system_info_t& info, system_t& sys, iris_sequence<i...>) {
+			return components_t({ iris_make_key_value(get_type_hash<typename std::tuple_element<i, typename system_t::components_tuple_t>::type>(), reinterpret_cast<void*>(&sys.template component<typename std::tuple_element<i, typename system_t::components_tuple_t>::type>()))... },
+				typename components_t::allocator_type(system_infos.get_allocator()));
 		}
 
 		template <typename iterators_t, size_t i>
